@@ -1,0 +1,16 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import { withBase } from "../lib/site";
+---
+
+<BaseLayout title="Not Found | Build Notes" description="The page could not be found.">
+  <section class="section">
+    <p class="eyebrow">404</p>
+    <h1>Page not found</h1>
+    <p class="section__lead">
+      This route does not exist. Use the archive or tags to navigate back into
+      the published posts.
+    </p>
+    <a class="button button--primary" href={withBase("/")}>Back to the homepage</a>
+  </section>
+</BaseLayout>

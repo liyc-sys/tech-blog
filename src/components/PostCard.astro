@@ -1,0 +1,49 @@
+---
+import TagPill from "./TagPill.astro";
+import { slugifyTag, type Post } from "../lib/posts";
+import { withBase } from "../lib/site";
+
+interface Props {
+  post: Post;
+}
+
+const { post } = Astro.props;
+---
+
+<article class="post-card">
+  <div class="post-card__meta">
+    <time datetime={post.data.publishDate.toISOString()}>
+      {post.data.publishDate.toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      })}
+    </time>
+    {
+      post.data.updatedDate && (
+        <span>
+          Updated{" "}
+          {post.data.updatedDate.toLocaleDateString("en-US", {
+            year: "numeric",
+            month: "short",
+            day: "numeric",
+          })}
+        </span>
+      )
+    }
+  </div>
+
+  <h2 class="post-card__title">
+    <a href={withBase(`/posts/${post.id}/`)}>{post.data.title}</a>
+  </h2>
+
+  <p class="post-card__description">{post.data.description}</p>
+
+  <div class="post-card__tags">
+    {
+      post.data.tags.map((tag) => (
+        <TagPill href={withBase(`/tags/${slugifyTag(tag)}/`)} label={tag} />
+      ))
+    }
+  </div>
+</article>

@@ -1,0 +1,61 @@
+---
+title: "Article Template: Background, Tradeoff, Result"
+description: "A starter template for writing technical posts that are concise enough for interviews and specific enough to be useful."
+publishDate: 2026-04-03
+tags:
+  - template
+  - writing
+draft: false
+---
+
+Use this structure when you want to turn a real engineering task into a post
+without drifting into a diary or a tutorial dump.
+
+## 1. Background
+
+What system were you working on? What constraint mattered most?
+
+- latency
+- quality
+- maintainability
+- operating cost
+- delivery speed
+
+## 2. Problem
+
+Describe the specific failure mode.
+
+- What symptom did users or engineers see?
+- How did you measure it?
+- Why was it worth fixing now?
+
+## 3. Options Considered
+
+List the main approaches and their tradeoffs.
+
+1. Option A and why it was tempting
+2. Option B and what risk it introduced
+3. Option C and why you ultimately chose it or rejected it
+
+## 4. Implementation
+
+Keep this section lean:
+
+- the few changes that mattered
+- the one or two details that were not obvious
+- the instrumentation or checks that kept the change safe
+
+## 5. Result
+
+Include evidence:
+
+- before and after metrics
+- what improved
+- what stayed unresolved
+
+## 6. Reflection
+
+Close with one lesson that generalizes beyond the exact project.
+
+That last section is where a post usually shifts from being a work log to being
+something an interviewer can actually discuss with you.

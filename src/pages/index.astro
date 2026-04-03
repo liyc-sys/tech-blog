@@ -1,0 +1,58 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import PostCard from "../components/PostCard.astro";
+import TagPill from "../components/TagPill.astro";
+import { getPublishedPosts, getTagSummary } from "../lib/posts";
+import { SITE_DESCRIPTION, SITE_TITLE, withBase } from "../lib/site";
+
+const posts = await getPublishedPosts();
+const latestPosts = posts.slice(0, 6);
+const tags = getTagSummary(posts).slice(0, 8);
+---
+
+<BaseLayout title={SITE_TITLE} description={SITE_DESCRIPTION}>
+  <section class="hero">
+    <p class="eyebrow">Technical Writing, Kept Simple</p>
+    <h1>Publish engineering notes that are worth sending to an interviewer.</h1>
+    <p class="hero__lead">
+      This site is intentionally narrow: articles, archives, tags, and RSS. No
+      profile page, no portfolio overhead, no résumé framing.
+    </p>
+    <div class="hero__actions">
+      <a class="button button--primary" href={withBase("/posts/")}>Browse all posts</a>
+      <a class="button button--ghost" href={withBase("/rss.xml")}>Subscribe via RSS</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section__header">
+      <div>
+        <p class="eyebrow">Top Tags</p>
+        <h2>Topics you can build around</h2>
+      </div>
+      <a class="text-link" href={withBase("/tags/")}>See all tags</a>
+    </div>
+
+    <div class="tag-grid">
+      {
+        tags.map((tag) => (
+          <TagPill href={withBase(`/tags/${tag.slug}/`)} label={`${tag.tag} (${tag.count})`} />
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section__header">
+      <div>
+        <p class="eyebrow">Latest Posts</p>
+        <h2>Recent writeups</h2>
+      </div>
+      <a class="text-link" href={withBase("/posts/")}>Open archive</a>
+    </div>
+
+    <div class="post-grid">
+      {latestPosts.map((post) => <PostCard post={post} />)}
+    </div>
+  </section>
+</BaseLayout>

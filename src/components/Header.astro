@@ -1,0 +1,22 @@
+---
+import { SITE_NAV, SITE_TITLE, withBase } from "../lib/site";
+---
+
+<header class="site-header">
+  <a class="site-brand" href={withBase("/")}>
+    <span class="site-brand__mark">B</span>
+    <span>{SITE_TITLE}</span>
+  </a>
+
+  <nav aria-label="Primary navigation">
+    <ul class="site-nav">
+      {
+        SITE_NAV.map((item) => (
+          <li>
+            <a href={withBase(item.href)}>{item.label}</a>
+          </li>
+        ))
+      }
+    </ul>
+  </nav>
+</header>

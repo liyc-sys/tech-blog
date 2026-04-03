@@ -1,0 +1,69 @@
+---
+import { render } from "astro:content";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import TagPill from "../../components/TagPill.astro";
+import { getPublishedPosts, slugifyTag } from "../../lib/posts";
+import type { Post } from "../../lib/posts";
+import { withBase } from "../../lib/site";
+
+export async function getStaticPaths() {
+  const posts = await getPublishedPosts();
+
+  return posts.map((post) => ({
+    params: { slug: post.id },
+    props: { post },
+  }));
+}
+
+interface Props {
+  post: Post;
+}
+
+const { post } = Astro.props;
+const { Content } = await render(post);
+---
+
+<BaseLayout
+  title={`${post.data.title} | Build Notes`}
+  description={post.data.description}
+>
+  <article class="article">
+    <div class="article__meta">
+      <p class="eyebrow">Post</p>
+      <time datetime={post.data.publishDate.toISOString()}>
+        {post.data.publishDate.toLocaleDateString("en-US", {
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+        })}
+      </time>
+      {
+        post.data.updatedDate && (
+          <span>
+            Updated{" "}
+            {post.data.updatedDate.toLocaleDateString("en-US", {
+              year: "numeric",
+              month: "long",
+              day: "numeric",
+            })}
+          </span>
+        )
+      }
+    </div>
+
+    <h1>{post.data.title}</h1>
+    <p class="article__dek">{post.data.description}</p>
+
+    <div class="article__tags">
+      {
+        post.data.tags.map((tag) => (
+          <TagPill href={withBase(`/tags/${slugifyTag(tag)}/`)} label={tag} />
+        ))
+      }
+    </div>
+
+    <div class="article__body">
+      <Content />
+    </div>
+  </article>
+</BaseLayout>

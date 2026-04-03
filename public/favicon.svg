@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title>Tech Blog</title>
+  <rect width="64" height="64" rx="14" fill="#10181a"/>
+  <path d="M18 18h28v6H30v10h14v6H30v18h-6V18Z" fill="#f3efe7"/>
+  <path d="M40 34h6l-6 12h-6l6-12Z" fill="#f28c28"/>
+</svg>

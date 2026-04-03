@@ -1,0 +1,28 @@
+---
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import TagPill from "../../components/TagPill.astro";
+import { getPublishedPosts, getTagSummary } from "../../lib/posts";
+import { withBase } from "../../lib/site";
+
+const posts = await getPublishedPosts();
+const tags = getTagSummary(posts);
+---
+
+<BaseLayout title="Tags | Build Notes" description="Topics used across the blog archive.">
+  <section class="section">
+    <p class="eyebrow">Index</p>
+    <h1>Tags</h1>
+    <p class="section__lead">
+      Keep tags sparse. They work best when they help an interviewer jump
+      directly to the topics they care about.
+    </p>
+
+    <div class="tag-grid">
+      {
+        tags.map((tag) => (
+          <TagPill href={withBase(`/tags/${tag.slug}/`)} label={`${tag.tag} (${tag.count})`} />
+        ))
+      }
+    </div>
+  </section>
+</BaseLayout>
