@@ -1,0 +1,651 @@
+---
+title: "“原生多模态”到底是什么意思：把 MLLM、ERNIE 5.0 和 LongCat-Next 真正分开"
+description: "围绕原生多模态、backbone、统一训练、预测目标，以及离散 token 如何落到图片和音频，系统厘清 Visual Encoder + Adapter + LLM、ERNIE 5.0 与 LongCat-Next 的真正差异。"
+publishDate: 2026-04-09
+tags:
+  - multimodal
+  - llm
+  - architecture
+  - training
+  - vision
+  - audio
+draft: false
+---
+
+最近连续读了两份很容易让人混淆的技术报告：
+
+- 美团的 [LongCat-Next](https://arxiv.org/abs/2603.27538)，arXiv 提交日期是 **2026-03-29**，官方技术文章发布日期是 **2026-04-02**
+- 百度的 [ERNIE 5.0 Technical Report](https://arxiv.org/abs/2602.04705)，arXiv 提交日期是 **2026-02-04**，官方博客发布日期是 **2026-02-06**
+
+这两篇都把自己往“原生多模态”这个方向描述，但只要继续往下问，很快就会出现一连串困惑：
+
+- 既然都有 `vision encoder` 和 `audio encoder`，为什么还说自己是原生多模态？
+- `backbone` 到底指什么？我做 `Visual Encoder + Adapter + LLM` 的 MLLM，能不能也说 backbone 一样？
+- `ERNIE 5.0` 和 `LongCat-Next` 都说统一自回归，它们的预测目标到底哪里一样，哪里不一样？
+- `LongCat` 生成出来的是离散 token，那它到底怎么变成真正的图片和音频？
+- `LongCat` 为什么没有视频，而 `ERNIE` 明明有？
+- `LongCat` 的 `dNaViT` 和 `Qwen2.5-ViT` 到底是什么关系，是替代关系，还是包含关系？
+- 我们平时说“原生多模态”，到底应该按什么标准判，而不是被论文口号带着走？
+
+这篇文章不是论文摘要，也不是“这两篇都很厉害”的综述。目标更具体一些：把上面这些会反复卡住人的概念逐个拆开，建立一套足够稳定的判断框架。以后再看到类似论文，只要把它们放回这套框架里，很多词不会再混。
+
+## 先说结论：原生多模态不是一个公认严格术语，而是一种架构立场
+
+这是最重要的一句。
+
+“原生多模态”在今天的论文里，通常不是一个像 `Transformer`、`MoE`、`RoPE` 那样定义稳定的硬术语。它更像一种架构立场声明：作者想表达某个模态在系统里是不是“一等公民”，而不是外挂组件。
+
+所以真正有用的问题不是：
+
+- 这篇论文有没有自称原生多模态？
+
+而是：
+
+- 它的统一发生在什么层级？
+- 模态专用部分被压缩到了哪里？
+- 主干模型是否真的是共享的？
+- 理解和生成是否共享同一条主路径？
+- 多模态是一起长出来的，还是后来接上去的？
+
+如果不把这几层分开，很多讨论都会变成“各说各话”。
+
+## 一个足够稳的判断框架：把“统一”拆成五层
+
+我更倾向于用下面五层来判断一个模型到底有多“原生”。
+
+### 第一层：联合训练，而不是后挂
+
+文本、图像、音频、视频这些能力，是不是从训练生命周期里就一起出现，而不是先有一个纯语言模型，后面再外挂视觉模块、语音模块和生成器。
+
+### 第二层：统一 backbone
+
+不同模态最后是不是进入同一个主干网络做上下文建模、推理和决策，而不是“语言一条主路，视觉一条主路，只在最后会合”。
+
+### 第三层：统一或近统一的预测目标
+
+是不是尽量把不同模态写成同一类自回归问题，或者至少放到同一个自回归家族下，而不是每个模态完全各做各的优化目标。
+
+### 第四层：理解和生成是否共享主接口
+
+看图回答、文生图、音频理解、语音生成，是不是主要都通过同一个主干和同一个表示接口完成，而不是理解走主干、生成走外挂解码器。
+
+### 第五层：模态专用设计是否被压缩到前后端
+
+这点特别关键。原生多模态不等于“完全没有 encoder、tokenizer、decoder”。更现实也更合理的标准是：
+
+- 模态专用部分只负责 `signal -> representation` 和 `representation -> signal`
+- 真正的推理、跨模态融合、下一步规划发生在统一主干里
+
+把这五层放在脑子里，后面很多概念就不乱了。
+
+## `backbone` 到底是什么意思
+
+`backbone` 最容易被误解成“整个模型”。其实不是。
+
+在多模态模型里，可以把系统粗暴地拆成三段：
+
+```text
+前端 -> backbone -> 后端
+```
+
+更具体一点：
+
+```text
+原始输入
+  -> tokenizer / encoder / projector
+  -> backbone
+  -> head / decoder / refiner / vocoder
+  -> 最终输出
+```
+
+这里：
+
+- 前端负责把原始文本、图片、音频变成模型能吃的表示
+- `backbone` 负责真正的上下文建模、推理、跨模态融合和下一步决策
+- 后端负责把 backbone 的结果变成最终输出
+
+所以当论文说“统一在 backbone”，它真正的意思是：
+
+- 前端和后端可以保留模态差异
+- 但做推理和规划的核心大脑只有一个
+
+这个定义放到具体结构里就很清楚。
+
+## 三类结构不要再混：典型 MLLM、ERNIE 5.0、LongCat-Next
+
+### 1. 典型 MLLM：`Visual Encoder + Adapter/Projector + LLM`
+
+```text
+Image
+  -> Vision Encoder
+  -> Projector / Adapter
+  -> LLM Backbone
+  -> Text Head
+  -> Answer
+```
+
+这类模型当然可以说 “backbone 一样”，但一定要注意它说的是最弱的一层意思：
+
+- `Vision Encoder` 不在 backbone 里
+- `Projector` 也不在 backbone 里
+- 真正的 backbone 是中间那坨 `LLM`
+
+所以这类模型可以说：
+
+- 共享同一个 `LLM backbone`
+
+但一般不该轻易说：
+
+- 原生统一多模态 backbone
+
+原因很简单：图像主要还是先在 backbone 外部被编码成连续特征，然后作为条件注入语言模型。视觉没有和文本在更强意义上共享同一个表示接口，也往往不是从训练第一天就在统一系统里共同长出来。
+
+### 2. ERNIE 5.0：统一发生在系统级
+
+`ERNIE 5.0` 的图可以概括成：
+
+```text
+Text / Image / Video / Audio
+  -> Modality Encoders / Tokenizers
+  -> Shared Autoregressive MoE Backbone
+  -> Text Head / Vision Decoder / Audio Decoder
+  -> Text / Image / Video / Audio
+```
+
+它的“原生”重点不是“完全没有模态前后端”，而是：
+
+- 从训练第一天起，text / image / video / audio 一起训练
+- 全部进入同一个 autoregressive backbone
+- router 是 modality-agnostic 的
+- 统一放在 `Next-Group-of-Tokens Prediction` 这个总框架下
+
+也就是说，ERNIE 的“原生”更偏 **系统级统一**：
+
+- 统一训练生命周期
+- 统一 backbone
+- 统一 routing
+- 统一 autoregressive 范式
+
+但这不等于它在表示层也是最纯的统一。后面会看到，尤其在视觉理解这件事上，它保留了明显的模态专用设计。
+
+### 3. LongCat-Next：统一发生在表示级
+
+`LongCat-Next` 的图可以概括成：
+
+```text
+Text / Image / Audio
+  -> Text Tokenizer / Vision Tokenizer / Audio Tokenizer
+  -> Shared Decoder-only MoE Backbone
+  -> Text Head / Visual Head + De-tokenizer / Audio Head + Decoder
+  -> Text / Image / Audio
+```
+
+它和 ERNIE 最大的不同，不是 backbone 有没有共享，而是它更执着于一件事：
+
+**尽量让视觉和音频也先变成离散 token，再进入统一主干。**
+
+所以我更愿意把 `LongCat-Next` 的“原生”叫做 **表示级统一**：
+
+- 视觉、音频都先 token 化
+- 然后像语言 token 一样进入共享主干
+- 理解和生成尽量都围绕统一的离散 token 接口来建模
+
+这也就是为什么 `LongCat` 会不断强调 `Lexicalizing Modalities as Discrete Tokens`。
+
+## 为什么有 `vision encoder` 和 `audio encoder`，还可以说自己原生
+
+这是很多人第一次读这类论文时最卡的点。
+
+原因是你心里可能隐含着一个过强的定义：
+
+> 原生多模态 = 完全没有模态专用前端
+
+但今天公开的工业级系统基本都做不到这一点。更现实的定义是：
+
+> 原生多模态 = 模态专用部分只负责把连续信号和统一表示接口对接起来；真正的推理、融合、决策发生在共享主干里。
+
+按这个口径：
+
+- `ERNIE 5.0` 可以说自己原生，因为它的统一发生在训练生命周期、backbone 和 routing 上
+- `LongCat-Next` 也可以说自己原生，因为它的统一发生在离散 token 接口和主干建模上
+
+所以“有 encoder”并不自动排除“原生”。真正要问的是：
+
+- encoder 是不是只是前端？
+- backbone 里是不是只有一个共享大脑？
+- 模态在主干里是不是一等公民？
+
+## `dNaViT` 和 `Qwen2.5-ViT` 到底是什么关系
+
+这是读 `LongCat-Next` 时最容易误会的一点。答案非常直接：
+
+**`Qwen2.5-ViT` 不是 `dNaViT` 的竞争方案，而是这版 `dNaViT` 里的前端语义编码器。**
+
+更完整地说，`dNaViT` 在论文里不是单指一个 encoder，而是一整套视觉离散化接口：
+
+```text
+dNaViT
+  = 语义较强的视觉编码器
+  + RVQ 离散量化
+  + paired de-tokenizer
+  + native-resolution pipeline
+```
+
+论文先在概念层定义了一类 `Semantic-and-Aligned Encoder (SAE)`，再在实现层说：
+
+- 这版没有重新从头训练 SAE
+- 直接采用 `Qwen2.5-ViT` 作为 encoder
+
+所以关系不是：
+
+- `Qwen2.5-ViT` vs `dNaViT`
+
+而是：
+
+- `Qwen2.5-ViT` 属于这版 `dNaViT` 的前端组成部分
+
+你可以把它理解成：
+
+- `Qwen2.5-ViT` 负责把图像变成语义很强的连续特征
+- `dNaViT` 再把这些连续特征量化成多层视觉 token，并负责反向把 token 解回图像
+
+## 预测目标到底哪里一样，哪里不一样
+
+这是理解两篇论文差别的关键。如果只听它们都说“统一自回归”，你会以为两边差不多；实际上，它们统一的层级不一样。
+
+### ERNIE 5.0：统一的是一个自回归家族
+
+`ERNIE 5.0` 的总框架是：
+
+- `Next-Group-of-Tokens Prediction`
+
+但这个大框架下面，不同模态保留了不同的具体形式：
+
+- 文本：`NTP + MTP`
+- 视觉：`NFSP = Next-Frame-and-Scale Prediction`
+- 音频：`NCP = Next-Codec Prediction`
+
+这意味着 ERNIE 的统一方式是：
+
+- 都放进同一个 autoregressive umbrella 里
+- 但视觉和音频允许保留各自更适合的组预测结构
+
+所以 ERNIE 不是把所有模态强行写成完全同一种 token prediction，而是把它们写成同一个自回归家族的不同成员。
+
+### LongCat-Next：统一的是离散 token 的 next-token 叙事
+
+`LongCat-Next` 的总框架叫 `DiNA`。它更想表达的是：
+
+- 视觉和音频也可以像语言一样被词元化
+- 然后尽量回到统一的 next-token prediction 叙事
+
+这不代表视觉和音频内部没有结构。实际上，LongCat 也有明显的多层结构：
+
+- 视觉 token 是多层 RVQ code
+- 音频 token 也是多层离散码
+
+但它们在论文里的表述重点不是“我为视觉定义了一个全新的 `NFSP`，为音频定义了一个全新的 `NCP`”，而是：
+
+- 主干保持单步自回归推进
+- 在每个位置上，再由 `DepthTransformer` 把多层 token 并行解出来
+
+论文原文里这点写得很清楚：
+
+- language model performs **single-step autoregressive prediction**
+- multimodal tokens are decoded **in parallel**
+
+因此更准确的说法是：
+
+- `ERNIE 5.0`：统一的是 **自回归训练家族**
+- `LongCat-Next`：统一的是 **离散 token 接口和 next-token 风格叙事**
+
+## LongCat 生成图片时，到底发生了什么
+
+这部分最容易被脑补错。LongCat 生成图片，不是直接从主干模型里“吐像素”，而是先吐一串视觉离散码，再把这些码解成图。
+
+可以把整条链路写成：
+
+```text
+文本 prompt
+  -> 文本 token
+  -> Shared Backbone
+  -> 视觉位置的 hidden state
+  -> DepthTransformer 并行解出多层视觉 code
+  -> Visual De-tokenizer
+  -> Pixel Decoder
+  -> Image Refiner
+  -> 最终图片
+```
+
+这里有几个关键点必须分清。
+
+### 第一，主干模型不是在预测像素，而是在预测视觉 token
+
+LongCat 的主干模型按序列一步一步往前走，但每一步预测的不是 RGB 值，而是一个视觉位置对应的隐藏表示。
+
+### 第二，一个视觉位置对应的不是单个简单 token，而是一组多层 RVQ code
+
+这一步由 `DepthTransformer` 完成。主干先产出这个位置的 hidden state，再由 `DepthTransformer` 在同一个自回归步里把这个位置对应的多层视觉码并行解出来。
+
+所以它的结构是：
+
+- 序列层面：一步一步自回归推进
+- 位置内部：多层视觉子码并行展开
+
+这也是论文反复强调“single autoregressive step + parallel decoding”的原因。
+
+### 第三，生成完离散码后，真正把它变成图片的是 visual de-tokenizer
+
+LongCat 的 visual de-tokenizer 分两步：
+
+- `pixel decoder`：先恢复出结构正确、语义正确的粗图
+- `image refiner`：再补高频纹理、锐度和细节
+
+所以从视觉 token 到图片不是一步完成，而是：
+
+```text
+视觉 token -> 粗图 -> 精修图
+```
+
+如果你之前脑子里想的是“LongCat 会不会像扩散模型那样直接 denoise 出图片”，答案是不是。它先生成离散视觉码，再由后端把视觉码翻译成图像。
+
+## LongCat 生成音频时，到底发生了什么
+
+音频侧也是同样的总思路：
+
+- 主干先生成离散音频 token
+- 后端再把 token 还原成真实声音
+
+但音频比图像多了一层非常重要的设计：**internal linguistic guidance**。
+
+整条链路可以写成：
+
+```text
+文本 / 上下文 / 对话状态
+  -> Shared Backbone
+  -> 文本 token 与音频 token 的对齐建模
+  -> 多层音频 code
+  -> Audio Decoder
+  -> Mel Spectrogram
+  -> Flow-based / DiT refinement
+  -> Vocoder
+  -> 最终波形
+```
+
+这里有四个点值得特别记住。
+
+### 第一，LongCat 生成语音时，不想让语音脱离文本语义
+
+所以它把文本显式纳入音频生成过程，称为 `text-guided audio modality`。你可以简单理解成：
+
+- 模型不是先单独想声音怎么长
+- 而是让“说什么”和“怎么说”在统一上下文里耦合起来
+
+### 第二，它支持两种生成方式
+
+- `serial generation`：先生成文本，再生成对应音频
+- `parallel generation`：文本和音频同时生成，但音频故意延迟几个步长
+
+这两种方式不是两套独立系统，而是同一个统一训练范式里的两个极端。训练时，论文是通过随机 delay 让模型学会在不同延迟下保持文本和音频对齐。
+
+### 第三，音频也不是一个简单 token，而是多层离散码
+
+和视觉一样，音频 token 本身是多层结构：
+
+- 前层更偏语义
+- 后层更偏声学细节、音色、韵律
+
+### 第四，真正把 token 变成声音的是 audio decoder、refinement 和 vocoder
+
+LongCat 的论文在音频落地链路上比 ERNIE 写得更细：
+
+- 先从离散音频 token 恢复粗 Mel
+- 再做 refinement 去掉量化伪影
+- 最后交给 vocoder 变成最终波形
+
+所以 LongCat 的音频生成不是“主干直接出波形”，而是：
+
+```text
+音频 token -> Mel -> 精修 Mel -> 波形
+```
+
+## LongCat 没有视频，这点必须说死
+
+这也是一个很容易混的点。
+
+`LongCat-Next` 这篇技术报告只覆盖：
+
+- text
+- image
+- audio
+
+没有视频生成主线，也没有视频 tokenizer / video decoder / video objective。
+
+如果你在脑子里把 `LongCat` 的视频能力和 `ERNIE 5.0` 的 `NFSP` 混到一起，后面很多解释都会错位。
+
+视频生成是 `ERNIE 5.0` 明确覆盖的；`LongCat-Next` 当前这版没有。
+
+## ERNIE 5.0 怎么把离散 token 变成图片、视频和音频
+
+ERNIE 和 LongCat 在这一层很像：都不是主干直接出像素或波形，而是先生成离散 token，再由后端解码器落成连续媒体。
+
+但它的模态特化更明显。
+
+### 图片
+
+ERNIE 的图像生成链路可以概括成：
+
+```text
+文本 prompt
+  -> Shared Backbone
+  -> visual token groups
+  -> Vision Decoder
+  -> 低分辨率结果
+  -> Cascaded Diffusion Refiner
+  -> 最终图片
+```
+
+和 LongCat 最大的差别是：
+
+- ERNIE 的视觉生成目标明确写成 `NFSP`
+- 也就是以“尺度组”为单位做 next-group prediction
+
+### 视频
+
+ERNIE 把图片视为单帧视频，把视频写成：
+
+- 时间维上的 `Next-Frame`
+- 帧内空间尺度上的 `Next-Scale`
+
+所以视频链路是：
+
+```text
+prompt
+  -> video visual tokens
+  -> Vision Decoder
+  -> 粗视频
+  -> diffusion refiner
+  -> 最终视频
+```
+
+### 音频
+
+ERNIE 的音频生成目标叫 `NCP = Next-Codec Prediction`。整条链路可以概括成：
+
+```text
+文本 / 上下文
+  -> Shared Backbone
+  -> semantic codec
+  -> residual codec
+  -> Audio Decoder
+  -> 最终波形
+```
+
+它的重点不是 LongCat 那种“先文本再音频”或“文本音频并行 delay”，而是更明显的 **codec-level coarse-to-fine prediction**。
+
+## 为什么说 ERNIE 的视觉理解没有 LongCat 那么“纯离散”
+
+这点很关键，也最能解释为什么我会说：
+
+- ERNIE 更偏系统级统一
+- LongCat 更偏表示级统一
+
+在 `ERNIE 5.0` 的视觉理解部分，论文明确写了：
+
+- 直接使用量化前的双路径特征
+- 一路是 `CNN` 的 perceptual features
+- 一路是 `ViT` 的 semantic features
+- 然后用 `Attention-Based Patch Merger` 融合
+
+这意味着它的视觉理解并不是“所有视觉能力都先走离散视觉 token，再进入统一主干”的最纯版本。它为了理解效果，保留了明显的 hybrid representation。
+
+而 `LongCat-Next` 更接近另一种立场：
+
+- 先把视觉变成多层离散 token
+- 再把多层 token 的 embedding 加和后送入主干
+
+所以 LongCat 的统一性更像是在说：
+
+**我不仅 backbone 共享，我连进入 backbone 的视觉表示都尽量统一成离散 token。**
+
+## 为什么我说 LongCat 也有统一训练，但它的“统一”不是 ERNIE 那种统一
+
+这里我以前用一句话带过，容易让人误解成“LongCat 没有统一训练”。这不对，必须讲细。
+
+LongCat 的训练流程是两阶段的：
+
+### Phase I：先训各模态 tokenizer
+
+- 视觉 tokenizer / de-tokenizer 单独训练
+- 音频 tokenizer 单独训练
+
+这一步的目标是先把连续信号变成可用的离散码。
+
+### Phase II：再做 native multimodality training
+
+进入这一步后：
+
+- language backbone
+- multimodal embeddings
+- decoders / heads
+
+一起训练，而 tokenizer 基本固定。
+
+所以 LongCat 当然有统一训练，只是它的统一主要发生在：
+
+- tokenizer 之后的主干建模阶段
+
+而 ERNIE 5.0 强调的是更强版本的统一：
+
+- text / image / video / audio 从训练第一天起一起长
+- 放在同一个 autoregressive framework 下共同优化
+
+因此更准确的说法不是：
+
+- LongCat 没有统一训练
+
+而是：
+
+- LongCat 的统一训练主要发生在离散化之后
+- ERNIE 的统一训练更贯穿整个训练生命周期
+
+## 回到最实用的问题：我做 `Visual Encoder + Adapter + LLM`，能不能说 backbone 一样
+
+可以，但只能在较弱意义上说。
+
+如果你的结构是：
+
+```text
+image -> visual encoder -> adapter -> LLM -> text
+```
+
+那你可以说：
+
+- 共享同一个 `LLM backbone`
+
+因为真正负责上下文建模和答案生成的核心大脑，确实还是同一个 LLM。
+
+但不要轻易把它升级成：
+
+- 原生统一 backbone
+- 和 ERNIE、LongCat 一样的 unified multimodal backbone
+
+原因在于：
+
+- 图像主要还是 backbone 外部编码好的连续特征
+- adapter 只是桥
+- 视觉和文本并没有先天共享同一个更强的 token interface
+- 输出往往还是文本中心
+
+所以这类结构更准确的叫法是：
+
+- **shared LLM backbone**
+- 或者 **LLM-centered MLLM**
+
+而不是：
+
+- **native unified multimodal model**
+
+## 一套够用的分级法：以后别再让“原生”这个词带节奏
+
+如果只想留下一套最实用的判断法，我会把模型分成下面三类。
+
+### 第一类：共享语言 backbone 的 MLLM
+
+典型形式：
+
+```text
+ViT + projector + LLM
+```
+
+特点是：
+
+- backbone 的确共享
+- 但统一主要停留在 LLM 这一层
+- 视觉仍然是外部条件注入
+
+### 第二类：系统级原生多模态
+
+代表是 `ERNIE 5.0`。
+
+特点是：
+
+- 统一训练生命周期
+- 统一 backbone
+- 统一 routing
+- 统一 autoregressive 总框架
+- 但前后端和部分理解路径仍保留明显的模态特化
+
+### 第三类：表示级原生多模态
+
+代表是 `LongCat-Next`。
+
+特点是：
+
+- 不只 backbone 共享
+- 还尽量让视觉、音频也先变成离散 token
+- 理解和生成都围绕统一离散接口组织
+
+今天公开的成熟工业系统，基本都停留在前两类或第三类，还远没有到“原始像素、波形、文本都直接进入完全同构主干”的信号级统一。
+
+## 最后一段总结：以后怎么最快判断一篇论文到底在说什么
+
+以后再看到“原生多模态”这五个字，不要先问它是不是原生，而要先问下面五个问题：
+
+1. 多模态能力是从训练一开始就一起长出来的吗？
+2. 不同模态是不是进入同一个 backbone？
+3. 它统一的是总框架，还是统一到 token 接口？
+4. 理解和生成是不是共享同一条主路径？
+5. encoder / decoder 是不是只是前后端，而不是另一个大脑？
+
+按这五个问题去看：
+
+- `Visual Encoder + Adapter + LLM`：共享的是 **LLM backbone**
+- `ERNIE 5.0`：统一的是 **训练生命周期 + backbone + routing + autoregressive framework**
+- `LongCat-Next`：统一的是 **离散 token 接口 + backbone + 自回归叙事**
+
+如果一定要压成一句话：
+
+> `ERNIE 5.0` 更像“系统级原生统一”，`LongCat-Next` 更像“表示级原生统一”，而常见的 `ViT + projector + LLM` 只是“共享语言 backbone 的多模态增强 LLM”。
+
+到这里为止，很多表面上像是在争术语的讨论，其实已经可以落回很具体的工程差异上了。
