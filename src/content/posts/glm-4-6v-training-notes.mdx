@@ -1,0 +1,628 @@
+---
+title: "GLM-4.6V 训练笔记：从多模态预训练、Long CoT 到 RLCS 与 RL Infra"
+description: "围绕 GLM-4.6V 及其所属 GLM-V 系列，系统整理模型结构、训练阶段、数据规模、RLCS、force answering、garbling 与基础设施优化。"
+publishDate: 2026-04-09
+tags:
+  - multimodal
+  - llm
+  - reinforcement-learning
+  - infrastructure
+  - training
+draft: false
+---
+
+GLM-4.6V 最值得认真读的，不只是分数表，而是它把一套多模态模型从预训练、长链路监督微调，一直推到跨领域强化学习时，究竟遇到了哪些工程问题，又是怎么把这些问题拆开处理的。
+
+从论文表述看，`GLM-4.6V` 并不是一个孤立模型，而是 `GLM-4.1V-Thinking`、`GLM-4.5V`、`GLM-4.6V` 共享的一套训练框架中的后继版本。这个框架有几个非常清晰的特点：先做大规模多模态预训练，再做长上下文继续训练，再用 long-CoT SFT 做冷启动，最后用跨领域 RL 把能力往上推。真正有意思的部分，恰恰在这些阶段之间的衔接上。
+
+这篇文章把前面几次阅读和讨论过的内容重新整理成一篇完整笔记，重点放在四个问题上：
+
+- `GLM-4.6V` 的结构和模型规模究竟是什么。
+- 它的训练过程到底分几段，每段用了什么数据、什么配方。
+- `RLCS`、`force answering`、`garbling` 和 reward system 分别在解决什么问题。
+- 论文里提到的 RL 基础设施优化，具体是什么意思。
+
+## 先把模型本体讲清楚
+
+`GLM-4.6V` 本体是一个 `106B-A12B` 的 MoE 多模态模型：
+
+- 总参数量约 `106B`
+- 每次激活参数量约 `12B`
+- 同系列的 `GLM-4.6V-Flash` 是一个 `9B` dense 模型
+
+从架构上看，这个系列共享三段式结构：
+
+- 一个视觉编码器 `vision encoder`
+- 一个视觉到语言的 `MLP adapter`
+- 一个大语言模型 `LLM decoder`
+
+具体到初始化来源：
+
+- 视觉侧初始化自 `AIMv2-Huge`
+- `GLM-4.6V-Flash` 的语言侧初始化自 `GLM-4-9B-0414`
+- `GLM-4.6V` 的语言侧初始化自 `GLM-4.5-Air`
+
+这意味着它虽然是统一训练的多模态模型，但并不是那种“从零开始一体化长出来”的单一 backbone。更准确的说法是：它是一个 **统一训练、统一对齐、统一强化学习的 VLM**，但底座仍然能清晰拆成视觉侧和语言侧。
+
+论文还提了几个与多模态输入直接相关的结构细节：
+
+- 在 ViT 侧加入 `2D-RoPE`，用来适配任意分辨率和极端长宽比图像
+- 同时保留原始可学习绝对位置编码，并用双三次插值适配变长输入
+- 在语言模型侧把 RoPE 扩成 `3D-RoPE`，增强空间理解
+- 对视频输入，在每帧后面插入显式的 `time index token`，把时间戳编码成字符串喂给语言侧
+
+这个设计不是简单地“把图像 patch 扔给 LLM”，而是在空间和时间两个方向上都显式补足了位置信息。
+
+## 它到底算不算原生多模态
+
+这个问题的答案取决于“原生”的口径。
+
+如果按能力和训练流程来定义，`GLM-4.6V` 显然是原生多模态的：图像、视频、长文档、GUI、工具调用都在同一个模型里统一建模，训练过程也是统一的多模态预训练、SFT 和 RL。
+
+如果按更严格的架构血统来定义，也就是要求“不是视觉编码器加语言模型的组合式架构”，那它不属于最严格意义上的原生多模态。它仍然是：
+
+- 预训练视觉模型
+- 语言模型
+- 中间对齐模块
+- 再配合统一训练与对齐
+
+这也是当前高性能 VLM 的主流路线。真正决定系统上限的，已经不只是骨架是不是一体，而是数据、对齐和 RL 体系是不是做通了。
+
+## 训练流程可以分成四个阶段
+
+整套流程大致可以按下面四段理解：
+
+1. 多模态预训练
+2. 长上下文继续训练
+3. long-CoT SFT 冷启动
+4. 跨领域 RL
+
+这四段并不是彼此独立的训练任务，而是顺次衔接的。前一段的目标，是为后一段创造更稳定、更高上限的起点。
+
+## 第一阶段：多模态预训练
+
+### 这一步在做什么
+
+这一阶段的目标，是先把模型做成一个足够强的多模态基础模型。论文里有一句很关键的话：**预训练基础模型的强弱，基本决定了后面 RL 能达到的上限。**
+
+也就是说，他们并不把 RL 看成“万能补丁”。如果基础模型的视觉语言知识、OCR、grounding、长图文理解、视频基础认知不够，后面的 reasoning-centric RL 很难真正把能力拉起来。
+
+### 这一步用了哪些数据
+
+论文在数据部分给了不少量级信息，但并不是每一类都公布了完整 token 数。比较明确的有：
+
+- 初始图文对池：`>10B` image-text pairs
+- 学术书籍：`>100M` digitized books
+- OCR 预训练数据：`220M` 图像
+- 自然图像 grounding：`40M` 标注
+- GUI grounding：`>140M` 问答对
+- instruction tuning data：`50M` samples
+
+预训练数据的来源也不只是一种。按论文的写法，可以拆成几条主要管线：
+
+- 大规模图文对数据，先经过启发式过滤、CLIP relevance filtering、概念重采样，再做 factual-centered recaptioning
+- 网页和书籍中的图文交错数据，重点解决高噪声和信息密度不均的问题
+- OCR 数据，覆盖合成文档、自然场景文字、学术文档、表格和公式
+- grounding 数据，同时覆盖自然图像和 GUI 页面
+- 视频数据，专门强化动作、场景文本和镜头信息
+
+这里最值得注意的一点是，它的数据工作并不是“收集更多数据”这么简单，而是持续在做：
+
+- 过滤
+- 再标注
+- 再采样
+- 迭代增强
+
+这一点和很多 VLM 系统的真实分水岭是一致的。架构差异未必拉得特别开，数据引擎和过滤质量往往更决定最终效果。
+
+### 预训练配方公开了多少
+
+这一阶段，论文给出了比较明确的训练配方：
+
+- `seq_len = 8192`
+- `global batch size = 1536`
+- `120,000 steps`
+
+这一步训练时混合了前面提到的多种模态数据，但**不包含视频**。为了提高效率，训练里显式使用了 `data packing`，把多条变长样本尽量拼进接近最大长度的序列里。
+
+如果把这个配方换成一个近似处理过的 token 预算，可以算出大约是：
+
+```text
+8192 × 1536 × 120000 ≈ 1.51T tokens processed
+```
+
+这里要注意，这个数字是按训练形状推出来的“处理过的 token 预算”，不是论文直接公开的“独立语料 token 数”。
+
+## 第二阶段：长上下文继续训练
+
+第一阶段结束后，模型已经有了基础的视觉语言能力，但还没有真正适配：
+
+- 高分辨率图像
+- 视频输入
+- 特别长的图文交错上下文
+- 超长上下文窗口
+
+所以论文又做了第二阶段的 continual training。这个阶段把：
+
+- 视频输入
+- 超过 `8K` 的长图文交错数据
+
+加回训练里，并把配置改成：
+
+- `seq_len = 32768`
+- `global batch size = 1536`
+- 额外训练 `10,000 steps`
+
+如果继续按形状估算，处理量大约是：
+
+```text
+32768 × 1536 × 10000 ≈ 503B tokens processed
+```
+
+对 `GLM-4.6V` 来说，这还不是终点。论文接着把上下文窗口扩到 `131072 tokens`，并在这个长度上继续训练：
+
+- `context = 131072`
+- `batch size = 128`
+- `2000 steps`
+
+这一段对应的是 `128K` 长上下文能力的来源。
+
+## 第三阶段：long-CoT SFT 冷启动
+
+### 这一步不是为了灌知识
+
+论文对 SFT 的定位非常明确：**它的主要目标不是注入新知识，而是把模型对齐到适合后续 RL 的 reasoning style。**
+
+这是理解整套方法的一个关键点。按照这篇论文的思路，SFT 更像是在做三件事：
+
+- 教模型学会统一的输出格式
+- 教模型学会更稳定的长链路思考风格
+- 给 RL 提供一个足够稳的冷启动模型
+
+也正因为如此，论文会反复强调 cold-start 数据质量的重要性。
+
+### SFT 数据长什么样
+
+SFT 数据主打长链路推理，并且覆盖多个 domain。数据里既有：
+
+- 可验证任务，例如数学、物理、化学、OCR、grounding、GUI agent
+- 不可完全验证的任务，例如开放式视觉问答、写作、指令遵循
+
+样本主要是中英文，另有少量其他语言。更有意思的是，他们会先用预训练模型把：
+
+- 太简单的样本
+- 太困难的样本
+
+筛掉，只保留中等难度区域作为 SFT 冷启动数据。
+
+### 输出格式是 SFT 阶段先学好的
+
+SFT 阶段最重要的工程约束之一，就是统一输出格式：
+
+```text
+<think> ... </think> <answer> ... </answer>
+```
+
+对于有明确 final answer 的可验证任务，最终答案还必须放进：
+
+```text
+<|begin_of_box|> ... <|end_of_box|>
+```
+
+这个 boxed answer 不是形式主义，而是为后面的 RL answer extraction 服务的。论文明确提到，在多模态开放域任务里，直接靠 LLM 从自然语言输出里抽 final answer 非常不稳，corner case 太多，GUI agent 那种复杂 function call 更容易出问题。所以他们宁可强制格式化，也不愿把 answer extraction 完全托付给 judge model。
+
+### SFT 训练配方公开了多少
+
+这部分论文公开了：
+
+- full-parameter fine-tuning
+- `seq_len = 32768`
+- `GLM-4.6V` 最高支持到 `131072`
+- `global batch size = 32`
+
+但是没有公开 SFT 的总 steps，也没有公开 long-CoT SFT 语料的完整样本总量，所以这一段没法像预训练那样反推出总 token 预算。
+
+### 双模训练是怎么做的
+
+`GLM-4.6V` 和 `GLM-4.5V` 都支持 thinking / non-thinking 两种模式。论文里给了一个很实用的做法：
+
+- 在用户 prompt 里显式追加 `/nothink`
+- 当这个 special token 存在时，训练模型生成空的 thinking 内容
+
+更关键的是，他们发现 non-thinking 模式并不需要额外精标一整套数据。直接拿 thinking 样本里的 `<answer>` 段作为 non-thinking 模式的目标，效果更好。
+
+这类结论很像真正做过大规模对齐的人才会写出来：不是每一种模式都要重建数据管线，有时更稳的办法是复用已有数据的某一部分。
+
+### 为什么 cold-start 数据质量很重要
+
+论文对这个问题的态度非常明确：cold-start 数据如果做差，RL 会不稳，严重时会直接 collapse。
+
+具体来说，问题主要出在这些地方：
+
+- reasoning path 里有大量无意义内容
+- `<think>` / `<answer>` 格式经常错
+- 中英混杂严重
+- 大段重复内容很多
+- reasoning style 不一致
+
+论文也给了一个很值得注意的经验：就算冷启动数据不完美，后续 RL 仍然可能有效；但**干净且一致的 cold-start 数据，会显著提升 RL 收敛稳定性和最终效果**。
+
+此外，他们还会把 RL checkpoint 里发现的高质量推理样本，再回灌到 cold-start 数据中，为下一轮 RL 提供更强起点。
+
+## 第四阶段：跨领域 RL
+
+### RL 在这篇里不是点缀，而是主力
+
+这篇论文最核心的部分，其实是 RL。作者把它写成了一个统一的多模态 RL 框架：
+
+- 一部分任务使用 `RLVR`
+- 一部分任务使用 `RLHF`
+- 目标是把 STEM、OCR、chart、grounding、video、GUI agent、long document、coding 等多个能力一起往上拉
+
+论文对这一阶段的总结很直接：**数据、reward、训练 recipe、infra，任何一层做差，都可能拖垮整套训练。**
+
+这也是为什么他们在后半篇大量篇幅都在讲：
+
+- data preparation
+- reward system
+- RLCS
+- 稳定性技巧
+- infrastructure
+
+## RL 之前的数据准备在做什么
+
+RL 数据准备并不是把已有 SFT 数据直接拿来训。论文里分了四步：
+
+1. `Task identification`  
+   先判断一个子任务是否适合验证。例如视频 captioning 太开放，temporal grounding 更适合做严格评估。
+
+2. `Data curation`  
+   把任务整理成 verifier 可以高精度判分的形式。论文专门提到，会把唯一正确答案的多选题改写成填空题，避免随机猜对带来噪声。
+
+3. `Quality validation and offline difficulty grading`  
+   用多个已有模型或更早的 RL checkpoint 跑 `pass@k`，再结合人工难度标注，对样本做细粒度分级。
+
+4. `Pilot RL experiments`  
+   先在各个子领域做小规模 RL 试验，确认这批数据值得训。
+
+这几步和传统“先收集数据，再统一丢给 trainer”的思路差别很大。它更像是在为 verifier 友好和 RL 信号质量倒推数据设计。
+
+## Reward system 是这篇的另一条主线
+
+### 为什么一定要按 domain 设计 reward
+
+论文反复强调一个结论：统一多模态 RL 中，任何一个子领域的 reward 只要明显失真，都可能拖垮整体训练。
+
+原因并不神秘。多模态任务的正确性标准并不统一：
+
+- 数学里 `43` 和 `43.0` 可以等价
+- OCR 里这两个字符串不一定等价
+- chart QA 可能要容忍一定数值误差
+- grounding 要看 IoU
+- GUI agent 还可能涉及动作序列和复杂函数调用
+
+所以 reward system 不能是一套万能 judge prompt，而必须是：
+
+- 共享基础校验函数
+- 每个子领域再单独做 verifier
+- 对 verifier 本身还要写单测
+
+论文里甚至给了一个负面案例：某个子域 verifier 质量不够，模型会学会 reward hacking，导致整体 benchmark 下滑。
+
+### 为什么要强制 boxed final answer
+
+论文详细讨论了 answer extraction 的困难。
+
+理论上，final answer 可以靠 LLM 去抽；这样不用强制模型输出结构化标记，回答也更自然。但在开放域多模态 RL 里，答案形式太复杂：
+
+- 有时是数字
+- 有时是带单位的表达式
+- 有时是文本
+- 有时是 GUI function call
+
+输出一旦很长、很乱、很绕，LLM 抽 answer 的误差就会迅速上升。于是他们选择了更偏工程化的路线：在 RLVR 阶段强制模型显式用 `<|begin_of_box|>` 和 `<|end_of_box|>` 标出最终答案。
+
+这件事背后其实有一个很现实的判断：相比让回答自然一点，训练阶段更需要 **稳定可解析**。
+
+## RLCS 到底是什么
+
+`RLCS` 是 `Reinforcement Learning with Curriculum Sampling`。它不是新的 RL 优化器，而是一套 **动态采样策略**。
+
+它要解决的问题很直接：
+
+- 模型变强之后，大量样本会变得过于简单
+- 在 GRPO 这类方法里，某个 prompt 如果 sampled responses 全对或者全错，往往给不出有效梯度
+- rollout 又是最贵的部分
+
+所以真正重要的问题变成了：**这轮 rollout 到底该花在什么样的样本上。**
+
+### RLCS 的做法
+
+论文里的 RLCS 可以拆成四步：
+
+1. 训练前先做 `offline difficulty grading`  
+   用多个已有模型或早期 checkpoint 在全量数据上跑 `pass@k`，再结合人工难度标注，把样本分成从 very easy 到 very hard 的多个难度桶。
+
+2. 训练中持续做 `online difficulty grading`  
+   对每轮 rollout 的结果记录 `pass@k` 表现，再把它映射回对应难度层级。
+
+3. 结合子领域表现和样本难度，动态重加权采样比例  
+   也就是不是固定采样，而是按迭代不断调整。
+
+4. 把采样重点放到“中等难度区域”  
+   过于简单的样本降采样，当前根本做不动的样本也降采样，把预算集中到最能产生学习信号的样本上。
+
+这个思路比单纯的 hard mining 更稳。因为 hardest samples 在当前阶段往往仍然是“全错”，一样没什么训练价值。真正有用的是模型能力边界附近的样本，也就是“既不会全对，也不会全错”的那一层。
+
+## force answering 是在解决什么
+
+这个点特别容易被误解成一种 decoding trick，实际上它是在解决 RL 里很具体的 credit assignment 问题。
+
+在 thinking 模式下，模型会先输出一大段 `<think>`。问题是 rollout 有长度上限。如果 thinking path 太长，模型可能在还没来得及输出 `<answer>` 之前就被截断。这样一来：
+
+- 这条 rollout 可能被直接记成 reward = 0
+- 即使前面的 reasoning 其实大体正确，也拿不到应得的训练信号
+- rollout 预算就白白浪费掉了
+
+`force answering` 的做法是：
+
+- 当推理快碰到 rollout 长度上限时
+- 人为插入一个 `</think>` token
+- 迫使模型立即收束到 answer 段
+
+这样做的直接效果有三个：
+
+- 减少因为超长 thinking 导致的无效样本
+- 让 verifier 更容易拿到 final answer
+- 训练模型学会在不同 thinking budget 下都能及时收尾
+
+这个技巧很朴素，但放在长链路 RL 里非常关键。否则模型可能越想越长，最后连奖励都拿不到。
+
+## garbling 到底是什么
+
+论文里说的 `garbling`，不是普通意义上的 hallucination，也不是单纯答错，而是更靠近“输出开始糊掉、坏掉、结构崩掉”。
+
+典型表现包括：
+
+- 大段重复
+- 标签闭合错误
+- 中英混杂严重
+- 结构化输出被破坏
+- token 序列开始出现无意义循环
+
+也就是说，hallucination 更像“内容看起来正常，但事实是错的”；garbling 则是“连输出表面结构都开始不正常了”。
+
+论文给了两个和 garbling 直接相关的结论：
+
+- 加入 `entropy loss` 促进多样性，反而会导致 garbled output，最后训练 collapse
+- rollout 时把 `top-p` 限得更小，例如 `0.9`，看起来像是在减小方差，实际上长期会增加 garbling 风险
+
+他们最后采用的是：
+
+- 去掉 `entropy loss`
+- rollout 时用 `top-p = 1`
+
+作者的解释是，`top-p = 1` 保留了全词表覆盖，避免稀有 token 学不充分，反而能保持结构化输出更干净。
+
+## RL Infra：论文里明确写了四个优化点
+
+这部分是整篇里非常值得仔细看的地方。作者明确把 RL 基础设施优化分成了四项：
+
+- DP ranks 的长度负载均衡
+- rank 内 sequence packing + gradient accumulation
+- rank 内样本重组 / re-packing
+- ratio EMA 的动态过采样
+
+它们看起来像四个分散的小技巧，实际上是一条完整流水线上的四个环节。
+
+## 1. DP ranks 的长度负载均衡
+
+在 data parallel 训练里，一个 step 往往要等所有 rank 都完成。问题在于 RL rollout 的样本长度事先无法知道：
+
+- 视频输入会很长
+- 长文档会很长
+- 难题的 thinking path 也会很长
+
+如果只是机械地给每个 rank 分配相同条数的样本，实际上并不公平。因为“条数相同”不等于“计算量相同”。某个 rank 一旦拿到很多超长样本，就会变成全局的 `straggler`。
+
+所以论文里的做法是：
+
+- rollout 结束后
+- 正式把训练样本分发给各个 DP rank 之前
+- 先按总序列长度和总计算负载做一次平衡
+
+这样每个 rank 的 forward-backward 时间会被控制在更接近的范围内，整体吞吐才不会被最慢那一组设备拖死。
+
+## 2. rank 内 sequence packing + gradient accumulation
+
+这一步解决的是另一个问题：即使跨 rank 已经做了负载均衡，单个 rank 内仍然是一堆变长样本，长度分布非常乱。
+
+论文的做法是：
+
+- 把一个 optimizer step 拆成多个 `micro-step`
+- 每个 micro-step 都使用固定长度 `context_length = 32K`
+- 把多个短样本 pack 进同一个 `32K` buffer
+- 再通过 gradient accumulation 把多个 micro-step 累积成一次参数更新
+
+这里的 `32K` 不是单条样本的长度，而是一次前向/反向所使用的 **固定张量形状上限**。它更像一个“箱子大小”。
+
+为什么这样做能提高效率？因为 RL 中大量样本是短的。如果不用 packing，训练只能：
+
+- 要么按最长样本统一 pad，大量浪费计算
+- 要么每条样本单独跑一次前后向，launch 成本很高
+
+packing 则允许把多个短样本放进同一个 `32K` 训练单元里，把 padding 压到很低。
+
+## 3. packing 不是简单拼接
+
+这也是最容易引起疑问的一点。把多个样本放进一个 buffer，难道不会把梯度信号搅在一起吗？
+
+如果只是“裸拼接”，当然会。因为后一个样本就能看到前一个样本，训练目标会被污染。
+
+真正的 packing 不是这样做的。它至少需要同时维护：
+
+- 样本边界
+- attention mask
+- loss mask
+- 通常还需要 position ids 的重置或等价处理
+
+也就是说，虽然多个样本物理上放在一个 `32K` buffer 里，计算图上仍然是分段隔离的：
+
+- 样本 A 只能看见样本 A 自己的前文
+- 样本 B 只能看见样本 B 自己的前文
+- pad 部分完全不参与 attention 和 loss
+
+从优化角度看，这样做与“多个独立样本共享一组参数，同时把 loss 累加或平均”是兼容的，并不会天然把梯度搞乱。会把梯度搞乱的是“只是拼起来但不做边界隔离”，那不叫 packing，只能叫错误的拼接。
+
+## 4. 为什么还要 gradient accumulation
+
+即使允许 packing，一个 rank 在某一轮里也往往拿到远超 `32K` 的总 token 量，所以仍然需要多个 micro-step 才能把这一轮样本全部跑完。
+
+这时就要做：
+
+- micro-step 1：装满一部分样本
+- micro-step 2：再装一部分
+- micro-step 3：继续装剩余样本
+
+然后把这些 micro-step 的梯度累积起来，最后统一更新一次参数。
+
+论文还特别提到，会按 `sample count` 对 micro-step 梯度加权平均，而不是简单地把每个 micro-step 一视同仁。这样才能在数学上尽量等价于“直接对整批 rollout 样本一次性求梯度”。
+
+## 5. rank 内 re-packing 在做什么
+
+有了 packing 还不够，因为“怎么装箱”本身就是一个优化问题。
+
+举一个抽象例子。如果某个 rank 拿到的样本长度分别是：
+
+- `18K`
+- `14K`
+- `13K`
+- `9K`
+- `8K`
+
+随手装箱可能会得到比较糟糕的结果，产生很多空洞和额外 micro-step。所谓 `re-packing`，就是在 rank 内再做一次启发式重排，让这些变长样本以更接近“填满 32K”的方式组合，从而：
+
+- 减少 micro-step 数量
+- 减少 padding
+- 减少总前后向次数
+
+论文直接说，这个优化在实践里把 forward-backward time 减半。这说明它不是小修小补，而是吞吐瓶颈上的核心优化。
+
+## 6. ratio EMA 的动态过采样
+
+这一项既是 RL 策略上的 trick，也是系统调度上的优化。
+
+问题出在 GRPO 一类方法对样本有效性的要求上：
+
+- 某个 prompt 如果 sampled responses 全对
+- 或者 sampled responses 全错
+
+那它往往给不出有效梯度。论文把这种情况统称为 `not valid sample`。
+
+如果每轮都 rollout 固定数量样本，就会出现一个问题：真正有学习信号的有效 batch size 会随着训练过程大幅波动。模型一旦变强，简单题大量全对，能用的样本就少了。
+
+为了解决这个问题，论文先做过采样：
+
+```text
+expansion_ratio = 1 / (1 - not_valid_sample_rate)
+```
+
+也就是说，如果上一轮有 `40%` 样本是全对或全错，那么下一轮先多 rollout 一些，再从中选出更有信息量的那部分。
+
+但瞬时比例会波动很大，所以他们再对这个比例做 `EMA`，用平滑后的 `expansion_ratio_ema` 作为下一轮的过采样系数。这样做有两个好处：
+
+- 训练上，有效 batch size 更稳定
+- 工程上，可以提前估计并行 rollout 需要多少样本，调度更容易
+
+## 这四个优化是怎么串起来的
+
+一轮 RL 训练可以大致理解成下面的流水线：
+
+1. 根据上一轮 `not_valid_sample_rate`，用 `ratio EMA` 估下一轮先 rollout 多少样本
+2. rollout 完后，筛掉一部分全对或全错、信息量低的样本
+3. 把剩余样本按长度和负载均衡分给不同 DP ranks
+4. 每个 rank 内再做 re-packing，尽量把样本装进更少的 `32K` micro-step
+5. 每个 micro-step 跑固定形状的前后向，并做 gradient accumulation
+6. 最后按 sample count 做等价的梯度汇总
+
+所以它们不是四个孤立的实现细节，而是一整套把“极不规则的多模态 rollout”转换成“GPU 友好的固定形状训练单元”的工程方案。
+
+## 数据规模到底公开了多少
+
+这个问题在阅读论文时很容易混淆，因为作者公开了很多“条数”，但总 token 数只公开了一部分。
+
+可以按三个层次区分：
+
+### 1. 语言底座的 token 数
+
+`GLM-4-9B` 在语言模型技术报告里明确写了：预训练大约用了 `10T` multilingual tokens。这是语言侧底座的数据规模。
+
+### 2. 多模态阶段的样本条数
+
+这部分公开得比较多，例如：
+
+- `>10B` 初始图文对
+- `>100M` digitized books
+- `220M` OCR 图像
+- `40M` grounding annotations
+- `>140M` GUI QA pairs
+- `50M` instruction tuning samples
+
+这些是条数或样本规模，不等于 token 数。
+
+### 3. 多模态训练的处理 token 预算
+
+这部分需要结合训练配方推算：
+
+- 预训练：约 `1.51T tokens processed`
+- 长上下文继续训练：约 `503B tokens processed`
+- `128K` 上下文扩展：约 `33.6B tokens processed`
+
+而 SFT 和 RL 的完整 token 预算，论文没有完整公开。
+
+## 一组常见问题
+
+### Q：`GLM-4.6V` 的语言侧到底初始化自什么？
+
+`GLM-4.6V` 初始化自 `GLM-4.5-Air`。  
+`GLM-4.6V-Flash` 初始化自 `GLM-4-9B-0414`。
+
+### Q：`GLM-4.6V` 本体多大？
+
+它是一个 `106B-A12B` 的 MoE 模型，也就是总参数约 `106B`，每次激活参数约 `12B`。
+
+### Q：它算严格意义上的原生多模态吗？
+
+如果按统一多模态输入、统一训练和统一对齐来定义，可以算。  
+如果按“不是视觉编码器 + 语言模型的组合”来定义，那不算最严格意义上的原生多模态。
+
+### Q：`force answering` 解决的本质问题是什么？
+
+它解决的是长链路 RL 中的 credit assignment 问题。模型如果思考太久而来不及输出 answer，reward 会被错误地打成 0。强制插入 `</think>`，是在保证 verifier 能拿到最终答案。
+
+### Q：`garbling` 是什么？
+
+不是简单答错，而是输出开始坏掉：重复、乱码化、标签结构崩坏、内容循环、格式失真。论文认为过强的 entropy regularization 和过小的 `top-p` 都会提高这类风险。
+
+### Q：packing 只是把样本拼在一起吗？
+
+不是。packing 的前提是样本边界、attention mask、loss mask 和位置处理都正确隔离。真正危险的是“裸拼接”，那会让后一个样本把前一个样本当作上下文，从而污染训练信号。
+
+## 最后回到这篇论文真正重要的地方
+
+如果只从模型名字上看，`GLM-4.6V` 很容易被误读成“又一个更大的 VLM 版本号”。但认真读完训练部分之后，真正明显的结论其实不是“模型更大了”，而是这套系统已经把多模态训练里的几个难点串起来了：
+
+- 数据不是单纯堆量，而是持续过滤、再标注和难度控制
+- SFT 不是终点，而是为 RL 提供稳定冷启动
+- reward system 决定多模态 RL 能不能训稳
+- RLCS 在解决 rollout 预算应该花在哪里
+- force answering 和 garbling 都是在处理长链路 RL 的现实故障模式
+- RL infra 的核心任务，是把极不规则的样本映射到稳定、高吞吐的训练系统上
+
+这些东西加在一起，才构成了论文里所谓的 reasoning-centric training framework。
+
+## 参考资料
+
+- GLM-V Team. *GLM-4.5V and GLM-4.1V-Thinking: Towards Versatile Multimodal Reasoning with Scalable Reinforcement Learning*. arXiv, 2026. https://arxiv.org/abs/2507.01006
+- Wenyi Hong et al. *CogVLM2: Visual Language Models for Image and Video Understanding*. arXiv, 2024. https://arxiv.org/abs/2408.16500
+- Team GLM. *ChatGLM: A Family of Large Language Models from GLM-130B to GLM-4 All Tools*. arXiv, 2024. https://arxiv.org/abs/2406.12793
