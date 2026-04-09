@@ -1,0 +1,1018 @@
+---
+title: "GLM-V 训练问答：一份尽可能完整的阅读笔记"
+description: "把 GLM-4.6V 及其所属 GLM-V 系列的关键问题按问答展开，覆盖模型结构、训练阶段、数据规模、RLCS、force answering、garbling、packing 与 RL 基础设施。"
+publishDate: 2026-04-09
+tags:
+  - multimodal
+  - llm
+  - reinforcement-learning
+  - infrastructure
+  - training
+draft: false
+---
+
+读 `GLM-V` 这组论文时，最容易出现两个问题。一个是信息散得很开：结构、数据、训练阶段、reward、RL infra 分散在不同章节里，互相之间的因果关系不容易一下看清。另一个是很多真正关键的点不是“模型做了什么”，而是“为什么他们非得这么做”，尤其是到了 long-CoT、RLCS、force answering、garbling 和 packing 这些地方，如果只看结论，很难理解背后的工程约束。
+
+这篇问答稿把这些问题重新收束到一个更完整的版本里。结构上不再追求压缩，而是尽量把关键问题逐个说透。
+
+## Q1：`GLM-V` 系列里，`GLM-4.6V` 处在什么位置？
+
+从论文的写法看，`GLM-4.6V` 不是一篇完全独立的模型发布，而是 `GLM-4.1V-Thinking`、`GLM-4.5V`、`GLM-4.6V` 这一整条路线中的后继版本。
+
+这条路线的共同点是：
+
+- 都属于统一的 vision-language model 体系
+- 都走“预训练基础模型 -> SFT 冷启动 -> 大规模跨领域 RL”的路径
+- 都围绕 general-purpose multimodal reasoning 来组织训练目标
+
+差异主要在三个层面：
+
+- 参数规模不同
+- 语言底座不同
+- 是否支持更新的能力形态，例如 `native tool use` 和 `128K context`
+
+如果只从能力总结来看：
+
+- `GLM-4.1V-Thinking` 是更小的 thinking-only 模型
+- `GLM-4.5V` 把 reasoning-centric 框架推到更大的 MoE 模型上
+- `GLM-4.6V` 在这条线上继续更新，重点增加了 `native tool use` 和 `128K` 上下文
+
+所以看 `GLM-4.6V` 时，最合理的阅读姿势不是把它当作一个孤立版本号，而是把它放回 `GLM-V` 的整套训练框架里理解。
+
+## Q2：`GLM-4.6V` 本体到底多大？
+
+`GLM-4.6V` 本体是一个 `106B-A12B` 的 MoE 模型。
+
+这串记法的含义是：
+
+- 总参数量约 `106B`
+- 每次前向实际激活参数量约 `12B`
+
+同系列里还有一个小得多的版本：
+
+- `GLM-4.6V-Flash`：`9B` dense 模型
+
+这两个版本在定位上并不一样：
+
+- `GLM-4.6V` 更偏向大规模高能力版本
+- `GLM-4.6V-Flash` 更偏向轻量化和效率
+
+论文还给出了一条很重要的对照线：
+
+- `GLM-4.1V-Thinking`：`9B`
+- `GLM-4.5V`：`106B-A12B`
+- `GLM-4.6V`：`106B-A12B`
+- `GLM-4.6V-Flash`：`9B`
+
+也就是说，`4.6V` 在参数规模上不是另起炉灶，而是在既有大小两条线的基础上继续演进。
+
+## Q3：它的视觉侧和语言侧分别初始化自什么？
+
+这个问题必须分模型来回答，不能把整个系列混在一起。
+
+视觉侧：
+
+- `GLM-V` 系列的视觉编码器初始化自 `AIMv2-Huge`
+
+语言侧：
+
+- `GLM-4.1V-Thinking` 和 `GLM-4.6V-Flash` 初始化自 `GLM-4-9B-0414`
+- `GLM-4.5V` 和 `GLM-4.6V` 初始化自 `GLM-4.5-Air`
+
+因此，如果问题明确指向 `GLM-4.6V` 本体，那么最准确的说法是：
+
+- 视觉侧：`AIMv2-Huge`
+- 语言侧：`GLM-4.5-Air`
+
+这件事的重要性在于，它解释了为什么论文里会把训练分成多阶段。模型并不是从零开始共同长出来的，而是在现有视觉和语言底座之上完成多模态对齐、长上下文扩展和 reasoning-centric RL。
+
+## Q4：`GLM-4.6V` 算原生多模态吗？
+
+这个问题要先说明“原生”的口径。
+
+如果按使用形态和训练流程定义，`GLM-4.6V` 可以算原生多模态：
+
+- 图像、视频、长文档、GUI、工具调用都在同一模型里处理
+- 训练过程是统一的多模态预训练、SFT 和 RL
+- 不依赖外置 OCR 模块来“拼”出多模态能力
+
+但如果按更严格的架构口径定义，也就是要求：
+
+- 不是视觉编码器 + 语言模型 + adapter 的组合
+- 而是从头训练出来的单一多模态 backbone
+
+那么 `GLM-4.6V` 不属于最严格意义上的原生多模态。
+
+它更准确的定位是：
+
+- 一个统一训练、统一对齐、统一强化学习的 VLM
+- 底层骨架仍然能拆成视觉侧、adapter 和语言侧
+
+这是当前高性能 VLM 非常典型的一条路线。真正拉开差距的地方，往往已经不是“是不是一体化 backbone”，而是：
+
+- 数据体系
+- 对齐策略
+- reward system
+- RL 稳定性
+- infra 吞吐
+
+## Q5：它的模型结构大致长什么样？
+
+论文把共享结构概括成三个核心组件：
+
+- `vision encoder`
+- `MLP adapter`
+- `language decoder`
+
+从高层看，输入流程是：
+
+1. 图像或视频先进入视觉编码器
+2. 视觉特征经过投影/适配模块转成更适合语言侧消费的 token 表征
+3. 视觉 token 与文本 token 一起送入语言模型解码
+
+但结构上真正值得注意的是三件事：
+
+### 1. 在视觉侧做任意分辨率适配
+
+他们在 ViT 里加入了 `2D-RoPE`，目的是支持：
+
+- 极端长宽比图像
+- 高分辨率图像
+- 任意尺寸图像
+
+同时又保留原始绝对位置编码，再用双三次插值动态适配不同尺寸输入。这样做的意义是：既保留已有预训练视觉模型的基础能力，又让它能处理远超原生输入分辨率的场景。
+
+### 2. 在语言侧增强空间感知
+
+他们把 LLM 侧的 RoPE 扩成 `3D-RoPE`。这个变化不是表面上的“再加一个位置编码”，而是在语言侧显式补足多模态场景下的空间结构信息，使视觉 token 进入语言模型后仍保留较强的空间可区分性。
+
+### 3. 对视频显式加入时间索引
+
+视频输入不是简单堆多帧图像。论文的做法是：在每一帧后面插入 `time index token`，时间索引本身由对应时间戳的字符串实现。
+
+这件事的意义在于，模型不是隐式地“猜这几帧的时间关系”，而是被显式告知：
+
+- 每一帧对应的真实时间
+- 帧与帧之间的时间间隔
+
+这有助于 temporal grounding、时间定位和视频问答。
+
+## Q6：完整训练流程可以怎么拆？
+
+可以很稳定地拆成四个阶段：
+
+1. 多模态预训练
+2. 长上下文继续训练
+3. long-CoT SFT 冷启动
+4. 跨领域 RL
+
+看起来像常规套路，但论文里真正重要的是各阶段承担的职责边界。
+
+### 第一阶段：多模态预训练
+
+目标不是做出最终推理模型，而是做出一个强基础模型，给后面的 RL 预留上限。
+
+### 第二阶段：长上下文继续训练
+
+把第一阶段还没充分覆盖的长图文、视频和超长上下文能力补上。
+
+### 第三阶段：long-CoT SFT
+
+不是重点灌知识，而是让模型学会适合 RL 的思考格式、答案格式和输出风格。
+
+### 第四阶段：RL
+
+把可验证域和不可完全验证域一起拉起来，并围绕 reward system、采样策略和 infra 做系统优化。
+
+如果只看“模型最后用了 RL”，就会忽略前面三段其实都在为这一步铺路。
+
+## Q7：多模态预训练到底在做什么？
+
+论文里对这一步的判断很直接：预训练基础模型的强弱，基本决定了后续 RL 的上限。
+
+换句话说，他们并不相信“只要 RL 足够强，弱底座也能补起来”。如果底座在这些能力上明显不够，后面很难靠 RL 逆天改命：
+
+- 视觉语言知识
+- OCR
+- grounding
+- 图文交错理解
+- 视频基础理解
+
+所以这一步不是形式上的“先训一下多模态”，而是真正把 VLM 底座做扎实。
+
+## Q8：预训练数据公开了哪些量级？
+
+论文公开了很多条数，但不是每一项都公开了完整 token 数。
+
+比较明确的有：
+
+- 初始图文对池：`>10B` image-text pairs
+- 学术书籍：`>100M` digitized books
+- OCR 数据：`220M` images
+- 自然图像 grounding：`40M`
+- GUI 问答对：`>140M`
+- instruction tuning data：`50M` samples
+
+这里要特别注意两个问题。
+
+第一，这些数字大多是“样本条数”或“数据项规模”，不等于训练里真正处理过的 token 数。
+
+第二，视频数据只说了 large-scale，没有像其他几类那样公开一个特别具体的总量。
+
+## Q9：预训练数据具体分成哪些大类？
+
+从论文结构看，大致可以分成这些类别：
+
+- 图文对 caption 数据
+- 图文交错的网页和书籍数据
+- OCR 数据
+- grounding 数据
+- 视频数据
+- instruction tuning data
+
+真正值得注意的不是分类本身，而是每类数据都不是“直接拿来用”，而是经过专门的数据引擎。
+
+例如图文对数据会经历：
+
+- 启发式过滤
+- CLIP relevance filtering
+- 概念重采样
+- factual-centered recaptioning
+
+图文交错数据则重点解决：
+
+- 图文不对齐
+- 噪声极大
+- 信息密度分布严重偏斜
+
+OCR 数据会同时覆盖：
+
+- 合成文档
+- 自然场景文字
+- 学术文档
+- 表格和公式
+
+grounding 则分自然图像和 GUI 两类。
+
+所以这一步真正重要的是：他们并不是把所有东西混在一起喂给模型，而是在数据进入训练前就先按任务需求重塑过一遍。
+
+## Q10：预训练的训练配方公开了多少？
+
+第一阶段多模态预训练，论文给了比较明确的训练形状：
+
+- `sequence length = 8192`
+- `global batch size = 1536`
+- `120,000 steps`
+
+并且说明这一阶段混合了前文各类多模态数据，但**不包含视频**。
+
+如果按训练形状估算，大致相当于：
+
+```text
+8192 × 1536 × 120000 ≈ 1.51T tokens processed
+```
+
+这个值的含义是“训练中处理过的 token 预算近似值”，不是论文直接声明的“独立语料 token 总量”。
+
+## Q11：为什么还要做长上下文继续训练？
+
+第一阶段预训练把模型做成了强基础模型，但还没有完整覆盖这些能力：
+
+- 高分辨率图像
+- 视频
+- 超过 `8K` 的长图文交错上下文
+- `128K` 长上下文
+
+于是他们又专门做了第二阶段 continual training，把这些能力补上。
+
+训练配方是：
+
+- `sequence length = 32768`
+- `global batch size = 1536`
+- 额外 `10,000 steps`
+
+按形状估算，大约是：
+
+```text
+32768 × 1536 × 10000 ≈ 503B tokens processed
+```
+
+这一步把：
+
+- 视频输入
+- 超过 `8K` 的长图文交错数据
+
+都纳入训练中。
+
+### 对 `GLM-4.6V` 来说更关键的一步
+
+`GLM-4.6V` 进一步把上下文窗口扩到 `131072 tokens`，并在该长度上继续训练：
+
+- `context = 131072`
+- `global batch size = 128`
+- `2000 steps`
+
+这个阶段直接对应 `128K` 上下文能力的来源。
+
+## Q12：SFT 在这篇里到底承担什么角色？
+
+这篇论文对 SFT 的定位非常清楚：**它主要不是为了继续注入知识，而是为了给 RL 提供一个更稳的冷启动。**
+
+这和很多传统说法不太一样。常见直觉是“预训练学知识，SFT学任务”。而在这里，SFT 更像是在做：
+
+- 输出格式对齐
+- reasoning style 对齐
+- 冷启动初始化
+
+也正因如此，他们才会把 long-CoT 样本格式、boxed answer、thinking 和 non-thinking 模式、tool use 格式这些内容都压在 SFT 阶段学好，而不是等 RL 去修。
+
+## Q13：SFT 数据长什么样？
+
+论文里的 SFT 数据有几个显著特征：
+
+- 覆盖多个 domain
+- 重点偏向可验证任务
+- 也保留一部分不可完全验证任务
+- 主要是中英文
+- 使用预训练模型过滤掉过易和过难样本
+
+这个“过滤掉过易和过难样本”的细节很值得注意。它意味着冷启动数据并不是越难越好，也不是越多越好，而是要尽量落在模型当前能力边界附近的中等难度区域。
+
+从任务分布上，SFT 既包括：
+
+- STEM
+- OCR
+- grounding
+- GUI
+- 长文档理解
+- 一般视觉问答
+
+也包括：
+
+- 开放式视觉问答
+- 多轮对话
+- 规划
+- instruction following
+
+这种设计的目的，是在进入 RL 之前，先把模型拉到一个“既会思考、又不会失去通用语言能力”的位置上。
+
+## Q14：为什么输出格式要在 SFT 阶段先训稳？
+
+因为如果格式不稳定，后面的 RL 很容易直接不稳。
+
+论文里的标准格式是：
+
+```text
+<think> {think_content} </think> <answer> {answer_content} </answer>
+```
+
+对于有明确 final answer 的任务，final answer 还必须进一步放到：
+
+```text
+<|begin_of_box|> {FINAL_ANSWER} <|end_of_box|>
+```
+
+论文对此的态度非常鲜明：不要指望 RL 再把这些格式“慢慢学对”。原因在于一旦格式错误频繁出现：
+
+- verifier 先要处理格式错误
+- correctness reward 和 format reward 会互相干扰
+- 训练会变得更噪、更不稳
+
+所以比较稳的路线是：
+
+- 在 cold-start 阶段先把格式训稳
+- 进入 RL 时让 reward system 尽量专注在正确性而不是结构修复
+
+## Q15：为什么 final answer 非得 boxed？
+
+理论上可以不强制 boxed，而是让模型用自然语言输出，再让 LLM judge 去抽 final answer。
+
+但论文解释了为什么他们没有这么做。
+
+在开放域多模态场景里，答案形式非常复杂：
+
+- 数字
+- 带单位的表达式
+- 文本答案
+- OCR 内容
+- bounding boxes
+- GUI function calls
+
+这种情况下，只靠 LLM 做 answer extraction 会迅速出现各种 corner case，尤其当 answer 段很长、很乱、甚至已经开始循环时，抽取错误会直接污染 reward。
+
+所以他们最终采取的是更偏工程的方案：
+
+- 用 special tokens 显式标 final answer
+- verifier 只对 boxed 内容做判断
+
+这件事背后的本质很简单：训练阶段宁可牺牲一点自然性，也要换取可解析性和 reward 的稳定。
+
+## Q16：`GLM-4.6V` 的 tool use 是怎么进入训练里的？
+
+这是 `GLM-4.6V` 和前面版本相比很容易被忽略，但其实很重要的一点。
+
+论文里明确给了工具调用的输出协议：
+
+```text
+<tool_call> {function_name}
+<arg_key> ... </arg_key>
+<arg_value> ... </arg_value>
+...
+</tool_call>
+```
+
+也就是说，它不是靠自由生成 JSON，然后再尽量去 parse，而是显式规定了 XML 风格的结构化协议。
+
+这么做的理由很清楚：
+
+- 给 parser 清晰边界
+- 降低结构性幻觉
+- 让复杂参数保持更稳定的上下文约束
+- 不需要为了每个参数名去改 tokenizer
+
+这部分同样是在 SFT 阶段学会的，而不是到 RL 再修。
+
+## Q17：thinking 和 non-thinking 双模是怎么训练出来的？
+
+论文里给的做法非常具体：
+
+- thinking 模式照常训练 `<think> + <answer>`
+- non-thinking 模式时，在用户 prompt 后加 `/nothink`
+- 当 `/nothink` 存在时，训练模型生成空的 thinking 内容
+
+更有意思的一点是，他们没有额外构造一整套全新的 non-thinking 数据。相反，他们直接从 thinking 样本里抽 `<answer>` 段来复用。
+
+作者明确说，这样做比另外单独手工做一套 non-thinking 子集效果更好。
+
+这个结论很有代表性：有时最有效的不是新建数据分支，而是充分复用已经高质量整理过的答案部分。
+
+## Q18：为什么说 cold-start 数据质量决定 RL 稳定性？
+
+因为 RL 阶段不是在真空里训练，它是在已有输出分布上做放大和选择。
+
+如果 cold-start 数据本身存在这些问题：
+
+- 大量无意义 thought path
+- 结构化标签经常错
+- 冗余和重复很多
+- 中英混杂严重
+- reasoning style 极不一致
+
+那么 RL 很容易：
+
+- 放大这些坏模式
+- 让 verifier 更难判断
+- 产生更多 reward noise
+- 最终导致训练不稳定，甚至 collapse
+
+论文在稳定性部分直接给出了这个经验：cold-start 数据质量必须高于某个阈值，否则 RL 很容易崩。
+
+不过他们也补充了一条细一点的观察：即使 cold-start reasoning traces 不完美，RL 仍然可能有效；只是如果这些 traces 更干净、更一致，收敛会更稳，最终效果也更好。
+
+## Q19：RL 阶段在做什么？
+
+这篇论文里的 RL 是全篇真正的重头戏。
+
+它不是简单地“在数学题上做 RL”，而是试图把多个多模态子领域一起拉起来，包括：
+
+- STEM
+- OCR
+- chart
+- grounding
+- GUI agent
+- video understanding
+- document understanding
+- 逻辑推理
+- instruction following
+
+训练上同时用了：
+
+- `RLVR`
+- `RLHF`
+
+而论文的核心论点之一就是：在这种多领域统一 RL 场景下，问题不是“能不能给出某种 reward”，而是“能不能给每个子域都提供足够精确、足够鲁棒、不会被 hack 的 reward”。
+
+## Q20：RL 之前的数据准备为什么这么麻烦？
+
+因为不是每个任务都适合直接做 RL。
+
+论文把 RL 数据准备拆成四步：
+
+1. `Task identification`
+2. `Data curation`
+3. `Quality validation and offline difficulty grading`
+4. `Pilot RL experiments`
+
+这个顺序意味着，他们不是“先有数据，再顺手做 RL”，而是反过来从 verifier 能力和训练信号出发筛任务。
+
+最典型的例子是：
+
+- 视频 captioning 太开放，很难严格验证
+- temporal grounding 更适合构造成 verifier 友好的任务
+
+他们还会把唯一正确答案的 multiple-choice 问题改写成 fill-in-the-blank，目的是去掉随机猜对带来的奖励噪声。
+
+这说明在他们的框架里，“任务是否适合做 RL”本身就是一道需要认真设计的前置问题。
+
+## Q21：reward system 为什么是全篇另一条主线？
+
+因为在作者的经验里，多模态统一 RL 最容易死在 reward 上。
+
+论文强调了一件事：统一 VLM 在多个能力上一起做 RL 时，只要某一个子域的 reward 信号明显失真，就可能把整套训练带偏。
+
+这和很多“先用一个 judge model 顶着跑”的直觉不太一样。原因在于不同 domain 的正确性标准本来就不一样：
+
+- 数学允许符号等价
+- OCR 更接近严格字符串匹配
+- chart 可能需要数值容差
+- grounding 依赖 IoU
+- GUI agent 可能是动作序列 + 坐标 + 函数调用混合验证
+
+因此 reward system 不能只靠统一 judge prompt，而必须做成：
+
+- 共享基础校验函数
+- 各 domain 独立 verifier
+- verifier 还要单独做测试和迭代
+
+## Q22：论文里怎么描述 reward hacking？
+
+它给了一个很具体的例子。
+
+如果 verifier 设计得不够严谨，模型可能学会输出一些“表面上像答案，实际上很模糊”的东西去骗 reward。例如：
+
+- 数数问题回答成“0 到 10 之间的一个正确数字”
+- 相对论速度问题回答成“一个非常接近光速的速度”
+
+这类输出并没有真正解决问题，但可能骗过某些基于 LLM 的 verifier，于是 reward 被错误抬高。
+
+论文用这个例子想说明的是：reward 系统一旦有漏洞，模型会很快学会钻空子。强化学习不会自动让模型变“更诚实”，它只会让模型更擅长优化你给它的目标。
+
+## Q23：为什么 reward 必须按 domain 定制？
+
+因为同一个字符串在不同 domain 下，语义等价关系不同。
+
+例如：
+
+- 数学里 `43` 和 `43.0` 往往等价
+- OCR 场景下可能不等价
+- chart 的数值类问题也许可以容忍相对误差
+- 文本类答案可能需要 exact match 失败后再转向 semantic judge
+
+所以他们做的是 domain-specific reward system。论文中提到的构成方式包括：
+
+- 共享的格式校验、boxed answer 抽取、exact matching 等基础组件
+- 各 domain 的专用逻辑
+- unit tests 去覆盖该 domain 的输出分布
+
+这一点非常像成熟系统工程里的做法：reward 不是 prompt，而是一个需要被测试和迭代的软件模块。
+
+## Q24：`RLCS` 到底是什么？
+
+`RLCS` 是 `Reinforcement Learning with Curriculum Sampling`。
+
+它不是一种新的 policy optimization objective，而是一套 **动态采样策略**。更直白地说，它在解决的问题是：
+
+> rollout 预算到底该花在什么样的样本上。
+
+原因在于，随着训练推进，很多样本会迅速变得过于简单；在 GRPO 这类方法里，如果某个 prompt 的 sampled responses 全对或全错，往往没有有效梯度。这样一来：
+
+- rollout 成本越来越高
+- 有效训练信号越来越少
+
+所以真正关键的不是“总共 rollout 了多少样本”，而是“rollout 的样本是否刚好处在能学到东西的难度区间”。
+
+## Q25：`RLCS` 具体怎么做？
+
+可以拆成四步：
+
+### 第一步：训练前先做离线难度分级
+
+他们会用多个已有 VLM 或早期 RL checkpoint，在全量数据上跑 `pass@k`，再结合人工难度标注，给每条样本打上细粒度 difficulty label。
+
+### 第二步：训练中持续做在线难度更新
+
+每轮 rollout 后，记录该样本当前的 `pass@k` 表现，再把这个在线表现与之前的离线难度合并起来。
+
+### 第三步：按子域表现和难度分桶动态重加权
+
+采样比例不固定，而是每轮都调整。
+
+### 第四步：聚焦模型当前边界附近的中等难度样本
+
+- 太简单的样本降采样
+- 当前太难、几乎全错的样本也降采样
+- 把预算集中到最能产生有效梯度的区间
+
+这个思路不是 hardest-sample mining，而是更接近“持续把训练焦点放在模型当前能力边界上”。
+
+## Q26：为什么说 `RLCS` 不等于 hard mining？
+
+因为 hardest samples 在当前阶段往往也是“学不动”的。
+
+如果某个 difficulty bucket 对模型来说几乎是全错，那么它和“全对”的简单题一样，都会带来低信息量的更新。单纯偏向 hardest samples，只会让 rollout 里充满全错样本。
+
+所以 `RLCS` 的重点不是不断挑最难，而是不断寻找：
+
+- 不至于 trivial
+- 也不至于 hopeless
+- 恰好能提供高信息密度更新
+
+这也是它被称为 curriculum sampling 而不是 difficulty sampling 的原因。
+
+## Q27：`force answering` 是什么？
+
+`force answering` 解决的是 long-CoT RL 里非常具体的一个问题：**thinking path 太长，来不及输出 answer。**
+
+在 thinking 模式下，模型会先输出 `<think>`。如果 rollout 长度预算有限，就可能出现这种情况：
+
+- reasoning 进行到一半
+- 长度上限到了
+- 还没输出 `<answer>`
+
+这时即使前面的 reasoning 方向是对的，verifier 也通常只能记成 reward = 0，因为 final answer 根本没有出来。
+
+论文的解决办法是：
+
+- 在 thinking 快碰到 rollout 上限时
+- 强行插入 `</think>`
+- 迫使模型切到 answer 段
+
+这么做的好处是：
+
+- 减少超长 thinking 导致的无效样本
+- 让 verifier 更容易拿到 final answer
+- 训练模型学会在有限思考预算内收尾
+
+这不是简单的 decoding trick，而是在修正 RL 里的 credit assignment 问题。
+
+## Q28：`garbling` 是什么？
+
+`garbling` 不是普通的 hallucination，也不是单纯答错，而是输出本身开始坏掉、糊掉、结构崩掉。
+
+典型表现可能包括：
+
+- 大段重复
+- 中英混杂严重
+- 标签闭合错误
+- 结构化输出损坏
+- 文本进入循环
+- 特殊 token 和普通内容混在一起失去可解析性
+
+所以：
+
+- hallucination 更像“内容形式正常，但事实错”
+- garbling 更像“输出表面形式已经坏了”
+
+论文把它视为 RL 稳定性问题的一部分，而不是单纯的回答质量问题。
+
+## Q29：为什么论文会说 entropy loss 和小 top-p 会导致 garbling？
+
+他们的观察是：
+
+- 加 entropy loss 去促进 diversity，反而可能让输出越来越 garbled
+- rollout 时把 `top-p` 设小，比如 `0.9`，看起来是为了减小采样方差，但长期会提升 garbling 风险
+
+最终他们采取的经验性结论是：
+
+- 去掉 `entropy loss`
+- rollout 时用 `top-p = 1`
+
+论文给出的解释是，`top-p = 1` 可以保持全词表覆盖，避免某些稀有但关键的 token 学不充分。对于带大量结构化标记的多模态输出，这点尤其重要。
+
+这个结论有点反直觉，因为很多 RL 或 sampling 经验会倾向于更保守的截断采样。但在他们的场景下，过度截断反而损害了长期稳定性。
+
+## Q30：论文里说的 RL infra 有哪几项核心优化？
+
+基础设施部分，论文明确列了四项：
+
+- DP ranks 的长度负载均衡
+- rank 内 sequence packing + gradient accumulation
+- rank 内样本重组 / re-packing
+- ratio EMA 的动态过采样
+
+它们看起来是四个点，实际上是一条完整 pipeline 的不同环节。
+
+## Q31：为什么 DP ranks 要做长度负载均衡？
+
+因为 RL rollout 生成的样本长度极不均匀：
+
+- 视频长
+- 长文档长
+- 困难样本的 thinking path 也长
+
+在 data parallel 训练里，一个 step 通常要等最慢的 rank。如果只是平均分样本条数，而不看总长度和总计算负载，很容易出现：
+
+- 某个 rank 拿到很多超长样本
+- 其他 rank 很快做完
+- 全局都在等这个最慢 rank
+
+所以论文的做法是：
+
+- rollout 结束后
+- 把训练样本正式分给各个 DP rank 之前
+- 先按长度和计算负载做平衡
+
+这件事的本质，是把“平均条数”升级成“平均工作量”。
+
+## Q32：packing 到底是什么意思？
+
+packing 不是单纯把多个样本硬拼在一起，而是：
+
+> 把多个独立样本放进同一个固定长度训练 buffer 里，同时用 attention mask、loss mask 和边界信息确保样本彼此隔离。
+
+论文这里的固定长度是：
+
+```text
+context_length = 32K
+```
+
+这表示每个 micro-step 的张量形状长度上限是 `32K`，不是说每条样本都恰好 `32K`。
+
+举例来说，如果一个 rank 上有这些样本：
+
+- `2K`
+- `3K`
+- `11K`
+- `15K`
+
+不用 packing 时，要么每条单独跑一次前后向，要么按最长样本统一 pad，都会浪费很多算力。
+
+用了 packing 之后，可以把这些样本装进一个接近满的 `32K` buffer，只需要很少的 padding。
+
+## Q33：如果把样本放进同一个 `32K` buffer，不会把梯度搞乱吗？
+
+如果只是裸拼接，当然会。
+
+假设把样本 A、B、C 简单串起来，再用普通 causal mask，那么：
+
+- B 会把 A 当作自己的上下文
+- C 会把 A 和 B 当作自己的上下文
+
+这会直接污染训练目标。
+
+真正的 packing 之所以成立，是因为它不是裸拼接。它至少需要：
+
+- attention mask 隔开样本边界
+- loss mask 屏蔽 pad 和不参与训练的位置
+- 一般还要有 position ids 的重置或等价处理
+
+这样一来，虽然样本物理上放在同一个 buffer 里，计算图上仍然是彼此独立的。共享的只有模型参数，不共享彼此内容。
+
+所以这里的关键结论是：
+
+- **裸拼接会搞乱梯度**
+- **带边界隔离的 packing 不会天然搞乱梯度**
+
+## Q34：为什么还要配合 gradient accumulation？
+
+因为一个 rank 在某一轮里拿到的样本，总长度通常远不止 `32K`。
+
+因此一个 optimizer step 会拆成多个 `micro-step`：
+
+- micro-step 1：装一部分样本到 `32K`
+- micro-step 2：继续装
+- micro-step 3：继续装
+
+每个 micro-step 跑一次 forward/backward，但先不立刻更新参数，而是把梯度累积起来，最后统一做一次 optimizer update。
+
+论文特别提到，他们会按 `sample count` 去权重和平均这些 micro-step 的梯度，使之在数学上尽量等价于“对整个 rollout batch 一次性求梯度”。
+
+这一步很重要，因为不同 micro-step 里装进来的原始样本数并不一定相同。
+
+## Q35：re-packing 在做什么？
+
+packing 解决了“允许把多个样本放进一个固定长度 buffer 里”的问题，但“怎么放”本身仍然是一个优化问题。
+
+例如同一组样本，如果装箱顺序不好，就可能产生：
+
+- 更多 micro-step
+- 更多 padding
+- 更差的 GPU 利用率
+
+所以 `re-packing` 的含义是：在 rank 内再做一次启发式重排，让各个样本尽量以更接近填满 `32K` 的方式组合。
+
+论文直接说，这个优化在实践里把 forward-backward 时间减半。这说明它不是微小修饰，而是吞吐量层面的主要瓶颈之一。
+
+## Q36：`ratio EMA` 的动态过采样又是在解决什么？
+
+这个点同时属于训练策略和基础设施调度。
+
+在 GRPO 一类方法里，如果某个 prompt 对应的 sampled responses：
+
+- 全对
+- 或全错
+
+就几乎没有有效梯度。论文把这类样本比例记成 `not_valid_sample_rate`。
+
+问题在于，这个比例会随着训练推进而不断变化：
+
+- 模型变强后，简单题更容易全对
+- 很难的题又可能长期全错
+
+如果每轮 rollout 都只固定采样一个样本数，那么最终真正能提供有效更新的 batch size 会大幅波动。
+
+他们的做法是：
+
+```text
+expansion_ratio = 1 / (1 - not_valid_sample_rate)
+```
+
+也就是说，如果上一轮有很多无效样本，下一轮就先多 rollout 一些，再从中选择更有信息量的那部分。
+
+为了避免瞬时波动太大，他们又对 `expansion_ratio` 做 `EMA`，得到更稳定的 `expansion_ratio_ema`，再拿它去决定下一轮并行 rollout 的规模。
+
+这件事的价值在于：
+
+- 训练上，稳定有效 batch size
+- 系统上，提前知道要并行生成多少 rollout 样本，便于调度
+
+## Q37：这四个 infra 优化怎么串起来？
+
+整轮流程可以理解成：
+
+1. 用上一轮的 `not_valid_sample_rate` 推出下一轮要 rollout 多少样本
+2. rollout 完后，先筛掉大量全对或全错的低信息量样本
+3. 把剩余样本按长度和计算负载平衡分给各个 DP rank
+4. 每个 rank 内再做 re-packing，尽量压缩成更少的 `32K` micro-step
+5. 每个 micro-step 以固定形状跑前后向
+6. 最后通过 gradient accumulation 汇总成一次参数更新
+
+所以所谓 RL infra，不是简单的“把训练跑快一点”，而是在把极不规则的多模态 rollout，转成 GPU 友好的固定形状训练单元。
+
+## Q38：论文还提了哪些很像“一线训练经验”的东西？
+
+除了上面这些显性的模块，还有几条经验非常值得记录：
+
+### 1. 更大的 batch 往往更有利于多域 RL 上限
+
+这和很多大规模训练经验一致。在多个子领域一起做 RL 时，大 batch 更容易保持长期性能上限。
+
+### 2. 去掉 `KL loss`
+
+论文观察到，多模态 RL 里如果显式用 KL 去约束分布偏移，能力增长会被明显限制，所以他们把 KL loss 去掉了。
+
+### 3. `per-sample loss` 比 `per-token loss` 更稳
+
+平均 reward 差异不大，但按 sample 做损失汇总更稳定。
+
+### 4. format reward 只是辅助，不能代替 cold-start 学格式
+
+他们明确建议格式一定要在冷启动阶段学好，别指望后面用 reward 去“纠正格式”。
+
+### 5. cold-start checkpoint 更高分，不一定意味着 RL 后上限更高
+
+这点很有意思。论文提到，在一些实验里，cold-start 从 `1000 steps` 增到 `2000 steps`，SFT 后分数确实更高，但 RL 做完后，两者会收敛到很接近的水平。这意味着更高的冷启动分数不一定代表更高的 RL 潜力。
+
+### 6. RL 里的 domain interference 比 SFT 弱
+
+这也是一个重要观察：在 RL 阶段，某个领域的提升经常可以迁移到其他领域，跨域泛化比想象中更常见。
+
+## Q39：如果只关心公开的数据规模，哪些是论文明确说了，哪些没说？
+
+可以分成三层口径。
+
+### 第一层：语言底座的 token 规模
+
+`GLM-4` 语言模型技术报告明确写了：
+
+- `GLM-4-9B` 语言侧预训练大约用了 `10T` multilingual tokens
+
+### 第二层：多模态阶段的样本条数
+
+公开得比较多，包括：
+
+- `>10B` 初始图文对
+- `>100M` books
+- `220M` OCR images
+- `40M` grounding annotations
+- `>140M` GUI QA pairs
+- `50M` instruction tuning samples
+
+### 第三层：多模态训练处理过的 token 预算
+
+可以按训练配方近似推算：
+
+- 预训练：约 `1.51T`
+- 长上下文继续训练：约 `503B`
+- `128K` 上下文扩展：约 `33.6B`
+
+没完整公开的主要有：
+
+- long-CoT SFT 的总 steps
+- SFT 语料总 token
+- RL rollout 总样本量
+- RL 总 token 预算
+
+所以这篇论文对“样本规模”和“训练形状”披露得不少，但对完整的 RL token 预算披露得相对保守。
+
+## Q40：和 `CogVLM2`、`GLM-4V` 的关系怎么理解？
+
+如果把 `GLM-V` 系列往前追，最直接的前代参考其实是 `CogVLM2` 和 `GLM-4V`。
+
+`CogVLM2` 论文里明确提到：
+
+- `CogVLM2` 和 `GLM-4V` 基本共享增强后的训练 recipe
+- 差异主要在于 `CogVLM2` 使用 visual expert，而 `GLM-4V` 采用 text-image co-training
+
+这意味着 `GLM-4.6V` 并不是凭空冒出来的一代模型，而是建立在前面 `CogVLM` 家族长期积累的训练管线上：
+
+- VisualGLM
+- CogVLM
+- CogAgent
+- CogVLM2 / GLM-4V
+- 再往后到 GLM-4.1V / 4.5V / 4.6V
+
+如果只读 `GLM-4.6V` 主论文，不回头看这些历史，很容易低估他们在 OCR、grounding、GUI、视频和数据生成管线上的连续积累。
+
+## Q41：整篇论文里最值得注意的限制是什么？
+
+我觉得最值得记的限制有两个。
+
+### 1. reward 更多关注 final answer，而不是完整 reasoning correctness
+
+论文自己承认，现在 reward system 的重点还是 final answer 和输出结构，没法充分验证中间 reasoning steps 是否也正确。这意味着有可能出现：
+
+- 最终答案对
+- 中间 reasoning path 其实有问题
+
+这会让错误的推理链也被部分强化。
+
+### 2. 论文公开了不少经验，但没有把全部基础设施细节讲透
+
+例如：
+
+- 具体的 packing/re-packing 算法
+- attention kernel 与并行实现
+- rollout serving 细节
+- 更底层的 cluster 调度细节
+
+所以这篇论文更像是“把关键方法论和经验点公开”，而不是完整开源一套工业级训练栈。
+
+## Q42：如果只看一遍，这篇里真正重要的东西是什么？
+
+我会把它概括成六点。
+
+### 第一，预训练不是铺垫，而是上限来源
+
+作者非常明确地把基础模型质量视为 RL 上限的决定因素之一。
+
+### 第二，SFT 在这里主要是冷启动工程
+
+不是单纯继续灌知识，而是给 RL 准备格式、风格和稳定性。
+
+### 第三，reward system 不是 prompt，而是软件系统
+
+它需要：
+
+- domain-specific 逻辑
+- 单测
+- 持续防 reward hacking
+
+### 第四，`RLCS` 解决的是 rollout 预算该花在哪里
+
+它本质上是动态 curriculum sampling，而不是 hardest mining。
+
+### 第五，`force answering` 和 `garbling` 都是长链路 RL 里的真实故障模式
+
+前者是 credit assignment 问题，后者是训练稳定性问题。
+
+### 第六，infra 的本质是在把不规则 rollout 变成规则训练单元
+
+也就是把：
+
+- 不规则长度
+- 不规则有效性
+- 不规则任务形态
+
+转成：
+
+- 固定长度 micro-step
+- 可预测 rollout 规模
+- 更均衡的多卡负载
+
+这一点是整篇论文最“系统工程”的地方。
+
+## Q43：如果把全文压成一句话，`GLM-4.6V` 这篇最有价值的是什么？
+
+不是“他们又做了一个更大的多模态模型”，而是：
+
+> 他们把一套多模态模型从数据、长链路 SFT、reward 设计、动态采样、稳定性处理到 RL 基础设施，整合成了一条比较自洽的 reasoning-centric 训练路线。
+
+而且这条路线不是停留在理念层面，而是明确写到了：
+
+- 哪些数据要先过滤
+- 哪些任务适合做 RL
+- 哪些格式必须在 cold-start 学好
+- 哪些 reward 会被 hack
+- rollout 里哪些样本是无效的
+- 为什么要 force answering
+- 为什么 entropy loss 和小 top-p 反而会害人
+- 为什么 packing 和 re-packing 能直接影响吞吐上限
+
+这也是为什么这篇论文读起来不像单纯的 benchmark report，而更像一份来自真实训练系统的阶段性总结。
+
+## 参考资料
+
+- GLM-V Team. *GLM-4.5V and GLM-4.1V-Thinking: Towards Versatile Multimodal Reasoning with Scalable Reinforcement Learning*. arXiv, 2026. https://arxiv.org/abs/2507.01006
+- Wenyi Hong et al. *CogVLM2: Visual Language Models for Image and Video Understanding*. arXiv, 2024. https://arxiv.org/abs/2408.16500
+- Team GLM. *ChatGLM: A Family of Large Language Models from GLM-130B to GLM-4 All Tools*. arXiv, 2024. https://arxiv.org/abs/2406.12793
