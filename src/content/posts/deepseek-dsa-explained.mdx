@@ -1,0 +1,857 @@
+---
+title: "DeepSeek DSA 技术拆解：从 Lightning Indexer 到 FlashMLA Sparse Kernel"
+description: "围绕 DeepSeek Sparse Attention 的算法、训练方式、MLA 接入路径、推理代码和稀疏 kernel，系统解释 DSA 为什么能在长上下文里真正省算力。"
+publishDate: 2026-04-11
+tags:
+  - deepseek
+  - llm
+  - attention
+  - inference
+  - architecture
+draft: false
+---
+
+最近在读 DeepSeek 的 `DeepSeek-V3.2-Exp` 技术报告时，我发现很多人提到 `DSA`，但解释往往停在一句“稀疏注意力”上。这种说法不算错，但远远不够。因为 DeepSeek 的 DSA 并不是随便把 attention 稀疏化一下，而是一套从训练目标、模型结构到推理 kernel 都连起来的设计。
+
+这篇文章只讲 **DSA = DeepSeek Sparse Attention**。目标不是复述摘要，而是把下面几件事真正讲清楚：
+
+- DSA 在 DeepSeek 语境里到底是什么
+- 它和普通 dense attention 的真实差异在哪里
+- 它是怎么接进 MLA 的
+- `Indexer` 在代码里到底做了什么
+- prefill 和 decode 两条路径为什么既相似又不同
+- FlashMLA 的 sparse kernel 为什么能真正把这件事跑快
+
+如果先给一句最短定义，那就是：
+
+**DSA 的核心不是“让 attention 变稀疏”，而是先用一个很便宜的 indexer 做 token 检索，再只对 top-k token 做真正昂贵的 MLA attention。**
+
+## 先把原始出处放清楚
+
+DeepSeek 官方公开 DSA 的原始技术报告是：
+
+- [DeepSeek-V3.2-Exp: Boosting Long-Context Efficiency with DeepSeek Sparse Attention](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf)
+
+配套官方代码和 kernel 在这里：
+
+- [DeepSeek-V3.2-Exp 官方仓库](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp)
+- [推理代码 `inference/model.py`](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py)
+- [671B 配置 `config_671B_v3.2.json`](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/config_671B_v3.2.json)
+- [FlashMLA 官方仓库](https://github.com/deepseek-ai/FlashMLA)
+
+从官方时间线看，`DeepSeek-V3.2-Exp` 和对应的 DSA 公开发布时间是 **2025-09-29**。
+
+## 先说结论：DSA 本质上是“模型内部的可学习检索 + 稀疏精算”
+
+很多稀疏注意力方案的直觉是：
+
+- 只看局部窗口
+- 或者看固定的块
+- 或者预先设定一些全局 token
+
+DeepSeek 这版 DSA 不一样。它不是固定规则的稀疏，而是 **内容驱动的细粒度 token 选择**。
+
+更准确地说，DSA 把原来的 dense attention 拆成两步：
+
+1. 用一个轻量 `lightning indexer` 给历史 token 打分
+2. 只保留 top-k token，主 attention 只在这些位置上做真正的注意力计算
+
+所以它更像一个两阶段检索系统：
+
+- 第一阶段是便宜的召回
+- 第二阶段是昂贵的精排
+
+区别只在于，这里被召回的不是文档，而是上下文里的历史 token。
+
+## DSA 的正式数学定义
+
+官方报告里，DSA 的原型由两个部分构成：
+
+- `lightning indexer`
+- `fine-grained token selection`
+
+对当前 query token `t` 和历史 token `s`，indexer 定义了一个索引分数 `I_{t,s}`：
+
+```text
+I_{t,s} = sum_j w^I_{t,j} * ReLU(q^I_{t,j} · k^I_s)
+```
+
+这里可以先只抓住三件事：
+
+- `q^I` 和 `k^I` 是 indexer 自己的一套轻量投影，不是主 attention logits 直接复用
+- `w^I_{t,j}` 是 query 相关的逐头权重
+- `ReLU` 被特意选进来，是为了 throughput
+
+有了 `I_{t,s}` 之后，DSA 会为每个 query token 取 top-k 的历史位置集合，然后只在这组 token 上做真正的 attention：
+
+```text
+u_t = Attn(h_t, {c_s | s in Top-k(I_t,:)})
+```
+
+这里最重要的不是公式形式，而是两个结构性质：
+
+- 它选的是 **token-level** 的位置，不是 block，不是 window
+- 对同一个 query token，**所有主 attention heads 共用同一份 top-k token 集合**
+
+第二点是后面 kernel 能做快的关键。
+
+## 为什么 DSA 不只是“稀疏化一下 attention”
+
+如果只从复杂度角度说，dense attention 的核心代价是 `O(L^2)`，DSA 把主 attention 降成了 `O(Lk)`，其中 `k << L`。
+
+但问题很快会来：  
+既然 indexer 还是要扫过所有历史 token，那它不还是 `O(L^2)` 吗？
+
+答案是：**是，但它便宜得多。**
+
+原因在于 indexer 并不做完整的 MLA attention，它更像一个轻量匹配器：
+
+- head 数更少
+- head dim 更小
+- 用的是更简单的 score 形式
+- 可以走 FP8
+- 最昂贵的 `V` 聚合只对 top-k 做
+
+因此 DSA 并不是把全部 `L^2` 都消掉，而是把最贵的那一大块从 `L^2` 改成 `Lk`。
+
+在官方 671B 配置里：
+
+- `n_heads = 128`
+- `index_n_heads = 64`
+- `qk_nope_head_dim = 128`
+- `qk_rope_head_dim = 64`
+- `index_head_dim = 128`
+- `index_topk = 2048`
+
+也就是说，在 128K 上下文里，每个 query token 最终只把大约 `2048 / 128000 ≈ 1.6%` 的历史位置送进真正昂贵的主 attention。
+
+## MLA 到底是什么
+
+如果你之前没有专门看过 DeepSeek-V2，这里确实很容易卡住。因为整篇文章会不断提到 `MLA`，而 DSA 又是直接长在 MLA 上的。
+
+`MLA` 是 **Multi-head Latent Attention**，最早由 DeepSeek 在 `DeepSeek-V2` 里引入。它要解决的核心问题不是“attention 不够准”，而是：
+
+**大模型在推理时，KV cache 太贵了。**
+
+先看普通多头注意力 `MHA` 的做法。对每个 token、每一层、每一个 attention head，你通常都要缓存：
+
+- 一份 key
+- 一份 value
+
+如果模型 head 数很多、上下文很长，这个缓存会非常大。长上下文推理时，显存和带宽经常不是被参数本身卡住，而是被 KV cache 卡住。
+
+MLA 的核心想法是：
+
+**不要为每个 head 直接缓存完整的 K/V，而是先把它们压进一个更小的共享 latent 表示里，推理时再按需要展开或映射。**
+
+### 用一句更直观的话说
+
+普通 MHA 更像这样：
+
+```text
+每个 token
+  -> 为 128 个 heads 分别存完整 key/value
+```
+
+MLA 更像这样：
+
+```text
+每个 token
+  -> 先存一份更小的共享 latent KV
+  -> 各个 heads 需要时再从这份 latent 里读出自己要用的部分
+```
+
+这就是 `latent` 这个词的意思。  
+它不是直接拿来做最终注意力的完整 K/V，而是一份更紧凑、更适合缓存的中间表示。
+
+### 在 DeepSeek-V3.2 里，MLA 的维度怎么拆
+
+结合官方配置，MLA 里最重要的几组维度是：
+
+- `n_heads = 128`
+- `kv_lora_rank = 512`
+- `qk_nope_head_dim = 128`
+- `qk_rope_head_dim = 64`
+- `v_head_dim = 128`
+
+这组数的含义可以这么看：
+
+- query 侧每个 head 的 key-query 维度是 `128 + 64 = 192`
+- 其中前 `128` 维是不带位置编码的 `NoPE` 部分
+- 后 `64` 维是带 `RoPE` 的位置部分
+- value 每个 head 的输出维度是 `128`
+- 但真正被缓存的共享 latent KV 只有 `512` 维，再加一个单独保留的 `64` 维 RoPE key 部分
+
+所以在 decode 时，真正被缓存和复用的关键东西不是“128 个 head 各自完整的 K/V”，而是：
+
+- `512` 维 latent noPE 部分
+- `64` 维 RoPE key 部分
+
+也就是后面会反复出现的：
+
+```text
+head_dim_k = 512 + 64 = 576
+head_dim_v = 512
+```
+
+这正是 FlashMLA README 里 decode 模式下那组 `576 / 512` 的来源。
+
+### 用一个简化公式看 MLA
+
+把细节先省掉，MLA 可以粗略写成下面这样：
+
+```text
+[c_t^KV, k_t^R] = W_kv^A h_t
+```
+
+这里：
+
+- `h_t` 是当前 token 的隐藏状态
+- `c_t^KV` 是压缩后的 latent KV 表示
+- `k_t^R` 是单独留下来的 RoPE key 部分
+
+随后，每个 head 的 key 和 value 都不是直接缓存出来的，而是从 `c_t^KV` 里映射出来：
+
+```text
+k_{t,i} = [W_{k,i}^{NoPE} c_t^KV ; k_t^R]
+v_{t,i} = W_{v,i} c_t^KV
+```
+
+这里最关键的结构是：
+
+- 每个 head 的 `NoPE key` 和 `value` 都来自同一个共享 latent `c_t^KV`
+- 所有 head 共享同一个 `k_t^R`
+
+这就解释了为什么 MLA 的缓存规模可以比普通 MHA 小得多。
+
+### 为什么 DeepSeek 还要把 query 拆成 `NoPE + RoPE`
+
+你在代码里会看到 query 也被拆成两部分：
+
+- `q_nope`
+- `q_pe`
+
+这并不是为了“看起来更复杂”，而是为了和 key 侧的拆分方式对应起来：
+
+- `q_nope` 去和 latent noPE key 匹配
+- `q_pe` 去和 RoPE key 匹配
+
+所以 decode 路径里的 score 实际上是两项相加：
+
+```text
+score = q_nope · kv_cache + q_pe · pe_cache
+```
+
+这也是为什么 `MLA.forward()` 的 decode 分支会写成两次 `einsum` 再相加。
+
+### MLA 的 MHA mode 和 MQA mode 是什么
+
+这一点也是第一次读代码时最容易混的。
+
+DeepSeek 在 `V3.2` 的附录和 FlashMLA README 里都区分了两种执行形态：
+
+- `MHA mode`
+- `MQA mode`
+
+最简单的理解是：
+
+- **MHA mode**：更接近普通多头注意力的计算视角，适合训练和 prefill
+- **MQA mode**：更接近推理时高效缓存和共享读取的视角，适合 decode
+
+官方材料里明确提到：
+
+- training 和 prefilling 用 `MHA mode`
+- decoding 用 `MQA mode`
+
+它们不是两套不同模型，而是 **同一套 MLA 在不同执行阶段采用的两种等价计算组织方式**。
+
+### 为什么 MLA 对长上下文特别重要
+
+因为长上下文下，attention 的两个主要成本通常是：
+
+1. 算 attention 本身的算力
+2. 存和读 KV cache 的显存与带宽
+
+MLA 主要缓解的是第二件事。  
+DeepSeek 在 `DeepSeek-V2` README 里直接写过，MLA 的目标就是通过 low-rank key-value union compression 降低 inference-time KV cache 的瓶颈。
+
+这也是为什么 DSA 必须和 MLA 一起看：
+
+- MLA 负责把“缓存什么”这件事做轻
+- DSA 负责把“算哪些 token”这件事做稀疏
+
+两者解决的是 related but different 的问题。
+
+## DSA 为什么是接在 MLA 上，而不是独立造一套 attention
+
+DeepSeek 在报告里明确说，DSA 是 **instantiated under MLA**。
+
+这一点非常关键，因为它说明 DeepSeek 的目标不是发明一个全新模型骨架，而是在 `DeepSeek-V3.1-Terminus` 的 MLA 基础上，通过 continued training 把 sparse attention 引进去。
+
+这样做有两个直接收益：
+
+1. 可以从已有大模型 checkpoint 继续训练
+2. 可以复用 MLA 在 decode 时的低 KV cache 成本优势
+
+官方报告还点出另一个更偏 kernel 的原因：  
+为了计算效率，每个 key-value entry 必须能被多个 queries 共享。因此 DSA 是基于 MLA 的 **MQA mode** 来实现的。
+
+换句话说，DeepSeek 不是随便挑了一个方便的 attention 形态，而是从一开始就在让算法结构和底层 kernel 需求对齐。
+
+## 先看真实配置，再看 demo 默认值
+
+如果你直接读 `inference/model.py`，会看到很多 demo 默认值，比如：
+
+- `dim = 2048`
+- `n_heads = 16`
+- `q_lora_rank = 0`
+
+这些不是 671B 真实配置，只是便于读代码的默认参数。
+
+真正的 671B 配置在官方 JSON 里：
+
+```json
+{
+  "dim": 7168,
+  "n_layers": 61,
+  "n_heads": 128,
+  "q_lora_rank": 1536,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+  "dtype": "fp8",
+  "index_n_heads": 64,
+  "index_head_dim": 128,
+  "index_topk": 2048
+}
+```
+
+这组参数后面会反复出现，尤其是：
+
+- `kv_lora_rank = 512`
+- `qk_rope_head_dim = 64`
+
+因为 decode 时的 key 维度正是 `512 + 64 = 576`。
+
+## DSA 在代码里是怎么接进 MLA 的
+
+最关键的代码入口有两个：
+
+- `Indexer.forward()`
+- `MLA.forward()`
+
+如果把官方代码压缩成一个可读骨架，主流程大概是这样：
+
+```python
+# adapted from DeepSeek-V3.2-Exp inference/model.py
+
+qr = q_norm(wq_a(x))
+q = wq_b(qr)
+
+kv_latent, k_rope = split(wkv_a(x))
+kv_latent = kv_norm(kv_latent)
+cache(kv_latent, k_rope)
+
+topk_indices = indexer(x, qr, start_pos, freqs_cis, mask)
+
+scores = main_attention_scores(...)
+scores += sparse_mask_from(topk_indices)
+probs = softmax(scores)
+out = probs @ values
+```
+
+也就是说：
+
+- 主 attention 还是 MLA
+- DSA 负责提供一份 token 级别的 top-k 索引
+- 非 top-k 位置被 mask 成 `-inf`
+- softmax 后只剩下选中的 token 真正有贡献
+
+要注意一点：  
+`model.py` 更像是 **算法语义参考实现**，不是最高性能实现。真正把 sparse attention 做快的是 FlashMLA 的稀疏 kernel。
+
+## 逐层拆 `Indexer.forward()`：DSA 真正的心脏
+
+官方 `Indexer` 的核心代码在这里：
+
+- [`inference/model.py`](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py)
+
+把关键逻辑整理一下，大概是：
+
+```python
+# adapted from Indexer.forward()
+
+q = self.wq_b(qr).view(bsz, seqlen, n_heads, head_dim)
+q_pe, q_nope = split(q)
+q_pe = apply_rotary_emb(q_pe, freqs_cis, False)
+q = concat(q_pe, q_nope)
+
+k = self.wk(x)
+k = self.k_norm(k)
+k_pe, k_nope = split(k)
+k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, False).squeeze(2)
+k = concat(k_pe, k_nope)
+
+q = rotate_activation(q)
+k = rotate_activation(k)
+
+q_fp8, q_scale = act_quant(q, block_size, scale_fmt)
+k_fp8, k_scale = act_quant(k, block_size, scale_fmt)
+
+cache(k_fp8, k_scale)
+
+weights = self.weights_proj(x.float()) * self.n_heads ** -0.5
+weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+index_score = fp8_index(q_fp8, weights, k_cache, k_scale_cache)
+
+topk_indices = index_score.topk(index_topk, dim=-1)[1]
+```
+
+这段实现里有几个非常关键的点。
+
+### 1. Indexer 有自己独立的一套 q/k 投影
+
+它不是把主 attention 的 logits 降精度后拿来裁剪，而是单独构造：
+
+- `wq_b(qr)` 生成 indexer 的 query
+- `wk(x)` 生成 indexer 的 key
+
+这意味着 DSA 的“选 token 机制”不是主 attention 的简单副产物，而是一个显式训练出来的轻量子网络。
+
+### 2. Indexer 自己也吃 RoPE
+
+代码里 `q_pe` 和 `k_pe` 都会过 `apply_rotary_emb`。  
+这表示 indexer 在做位置感知的 token 检索，而不是纯内容相似度检索。
+
+但要特别注意：
+
+- indexer 的 RoPE 调用是 `apply_rotary_emb(..., False)`
+- MLA 主路径的 RoPE 则用默认 interleaved 布局
+
+DeepSeek 官方 README 还专门提过，旧版 inference demo 在这里有实现偏差，后来修掉了。这个细节非常容易在复现时出错。
+
+### 3. 它在 FP8 前做了 Hadamard rotation
+
+代码里 `rotate_activation()` 会调用 `fast_hadamard_transform`：
+
+```python
+def rotate_activation(x):
+    return hadamard_transform(x, scale=hidden_size ** -0.5)
+```
+
+论文正文没有详细解释这一步，但从实现看，它大概率是为了让激活分布更适合后续量化和索引 kernel。这一条是我基于代码作出的推断，不是官方正文直接展开说明的内容。
+
+### 4. Indexer 的 key cache 是 FP8 的
+
+这两行很关键：
+
+```python
+self.k_cache = torch.zeros(..., dtype=torch.float8_e4m3fn)
+self.k_scale_cache = torch.zeros(..., dtype=torch.float32)
+```
+
+也就是说 indexer 在缓存历史 key 时，直接就是：
+
+- 量化后的 FP8 值
+- 对应 scale
+
+这不是普通 PyTorch 教学实现会顺手写出来的东西，而是在一开始就明确对齐后面高性能 kernel 的数据路径。
+
+### 5. 最终输出的是每个 query token 的 top-k 历史位置
+
+最后一行：
+
+```python
+topk_indices = index_score.topk(min(self.index_topk, end_pos), dim=-1)[1]
+```
+
+这里输出的不是“每个主 head 各自一份 top-k”，而是 **每个 query token 一份共享 top-k**。
+
+这件事非常重要，因为它决定了：
+
+- 后续稀疏 mask 的结构
+- FlashMLA kernel 能不能共享 KV 读取
+- decode 时能不能把 dequantization 成本摊薄
+
+## 为什么 top-k 是“共享给所有主 heads”的
+
+如果每个主 attention head 各自选自己的 top-k，表面上似乎更灵活，但工程上会立刻出问题：
+
+- `indices` 张量会多一个 head 维
+- 每个 head 的访存路径不同，gather 很散
+- KV 不能共享读取
+- decode 里的反量化几乎没法高效复用
+
+DSA 刻意把选择粒度定成：
+
+**每个 query token 一份 top-k，所有 query heads 共用**
+
+这会少掉一部分表达能力吗？理论上会。  
+但换来的系统收益巨大：
+
+- token 选择依然是内容自适应的
+- 主 attention 仍然保留 per-head 的打分和加权能力
+- kernel 终于能共享 K/V 数据路径
+
+这是一个非常典型的“为系统效率做约束，但约束点选得很准”的设计。
+
+## 再看 `MLA.forward()`：prefill 和 decode 是两条不同执行逻辑
+
+这一块如果不拆开，DSA 很容易被理解成“就是一个 mask”。
+
+实际上，prefill 和 decode 在 MLA 里的执行方式并不一样。
+
+### Prefill 路径
+
+在官方代码里，`mask is not None` 分支对应 prefill：
+
+```python
+q = torch.cat([q_nope, q_pe], dim=-1)
+kv = self.wkv_b(kv)
+kv = kv.view(bsz, seqlen, n_local_heads, qk_nope_head_dim + v_head_dim)
+k_nope, v = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
+k = torch.cat([k_nope, k_pe.expand(-1, -1, n_local_heads, -1)], dim=-1)
+scores = torch.einsum("bshd,bthd->bsht", q, k).mul_(self.softmax_scale)
+
+topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
+index_mask = torch.full((bsz, seqlen, seqlen), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
+index_mask += mask
+scores += index_mask.unsqueeze(2)
+
+scores = scores.softmax(dim=-1)
+x = torch.einsum("bsht,bthd->bshd", scores, v)
+```
+
+从语义上说，这等价于：
+
+```text
+scores[t, h, s] =
+  q[t, h] · k[s, h]   if s in topk(t)
+  -inf                otherwise
+```
+
+这确实实现了 DSA 的算法定义。
+
+但这里必须强调一个容易误读的点：
+
+**这个 Python demo 不是最快的 sparse prefill 执行方式。**
+
+它仍然先构造了一个 dense `scores`，再通过 `index_mask` 把非 top-k 位置打成 `-inf`。  
+这更像是“可读性正确实现”。
+
+真正高性能的 sparse prefill 在 FlashMLA 里，接口是：
+
+- `q: [s_q, h_q, d_qk]`
+- `kv: [s_kv, h_kv, d_qk]`
+- `indices: [s_q, h_kv, topk]`
+
+对应的等价逻辑其实是：
+
+```python
+focused_kv = kv[indices]
+P = Q @ focused_kv.transpose(-1, -2)
+S = softmax(P)
+out = S @ focused_kv
+```
+
+这才是真正的“先聚焦，再计算”。
+
+### Decode 路径
+
+decode 分支更能体现 DSA 和 MLA 的耦合设计。
+
+核心代码是：
+
+```python
+if self.dequant_wkv_b is None and self.wkv_b.scale is not None:
+    self.dequant_wkv_b = weight_dequant(self.wkv_b.weight, self.wkv_b.scale)
+
+wkv_b = self.wkv_b.weight if self.dequant_wkv_b is None else self.dequant_wkv_b
+wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+
+q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+scores = (
+    torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+    torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
+) * self.softmax_scale
+
+topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
+index_mask = torch.full((bsz, 1, end_pos), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
+scores += index_mask.unsqueeze(2)
+
+scores = scores.softmax(dim=-1)
+x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+```
+
+这条路径和 prefill 最大的不同在于：
+
+- decode 不会 materialize 完整 per-head K/V
+- 它把 score 拆成 `q_nope · kv_cache` 和 `q_pe · pe_cache`
+- 最终只在 latent KV 上做聚合，再映射回各 head 输出
+
+这正是 MLA 在 decode 阶段的价值所在。
+
+## 这里的 576 和 512 到底怎么来的
+
+很多人第一次看 FlashMLA README，会看到 decode 模式下这些数字：
+
+- `head_dim_k = 576`
+- `head_dim_v = 512`
+
+如果不结合 MLA 代码，会觉得这两个数很突兀。
+
+其实它们正好对应：
+
+- `576 = kv_lora_rank + qk_rope_head_dim = 512 + 64`
+- `512 = kv_lora_rank`
+
+也就是说：
+
+- key 侧由 latent noPE 部分和 RoPE 部分拼起来
+- value 侧只有 latent 部分
+
+这也是为什么 decode 时 FP8 KV cache 只量化前 512 维，而最后 64 维 RoPE 部分保留 bf16。
+
+## DSA 是怎么训练出来的
+
+这部分是 DSA 之所以“像一个完整方案”而不是“小技巧”的关键。
+
+官方 continued pre-training 分成两个阶段。
+
+### 第一阶段：Dense Warm-up
+
+这一步的目标非常明确：
+
+- 先不真的让模型 sparse
+- 保持 dense attention
+- 冻结主模型
+- 只训练 lightning indexer
+
+训练目标也很清楚。  
+对每个 query token，先把主 attention 在所有 heads 上求和，再在序列维度做 `L1` 归一化，得到目标分布 `p_t,:`。然后训练：
+
+```text
+L_I = sum_t D_KL(p_t,: || Softmax(I_t,:))
+```
+
+这可以理解成：
+
+**先让 indexer 学会模仿 dense attention 对“哪些 token 重要”的判断。**
+
+官方给的 warm-up 配置是：
+
+- 学习率 `1e-3`
+- 训练 `1000` steps
+- 每步 `16` 个 `128K` 序列
+- 总计约 `2.1B` tokens
+
+### 第二阶段：Sparse Training
+
+有了初始可用的 indexer 之后，真正把 sparse attention 引入训练：
+
+- 启用 top-k token selection
+- 主模型开始适应 sparse pattern
+- indexer 继续和主 attention 分布对齐
+
+但这一阶段的 KL 不再对整个历史序列做，而是只在选中的集合 `S_t` 上做：
+
+```text
+L_I = sum_t D_KL(p_t,S_t || Softmax(I_t,S_t))
+```
+
+这里还有一个非常重要的工程决定：
+
+**indexer 的输入从计算图里 detach。**
+
+也就是说：
+
+- indexer 只吃 `L_I`
+- 主模型只吃 language modeling loss
+
+这样做的好处是把“selector 学习问题”和“主模型语言建模问题”分开，避免 selector 的训练信号把主表示空间搅乱。
+
+官方给出的 sparse training 配置是：
+
+- 学习率 `7.3e-6`
+- `topk = 2048`
+- 训练 `15000` steps
+- 每步 `480` 个 `128K` 序列
+- 总计约 `943.7B` tokens
+
+这组数字已经说明，DSA 不是训几天试试的实验，而是大规模继续训练之后才落地的架构修改。
+
+## 为什么这种训练方式有效
+
+从训练逻辑上看，DSA 实际上解决了两个不同问题：
+
+1. **selector 怎么知道该选谁**
+2. **主模型怎么适应“信息只剩 top-k”之后的世界**
+
+Dense warm-up 主要解决第一个问题。  
+Sparse training 主要解决第二个问题，同时维持 selector 不跑偏。
+
+这套设计的好处是避免了两个很常见的失败路径：
+
+- 直接用 LM loss 训练 selector，梯度太绕，selector 不稳定
+- selector 和主模型耦合过紧，导致主模型表示退化
+
+从工程视角看，DeepSeek 对 DSA 的训练不是“让模型自己学会稀疏”，而是先给 indexer 一个可对齐的教师信号，再让主模型逐步适应这个稀疏结构。
+
+## FlashMLA 才是 DSA 真正省成本的另一半
+
+如果只有算法，没有 kernel，DSA 的意义会大打折扣。
+
+FlashMLA README 里明确写到，官方提供了：
+
+- token-level sparse attention for the prefill stage
+- token-level sparse attention for the decoding stage, with FP8 KV cache
+
+而且给出了性能数字：
+
+- sparse prefill: 最高约 `640 TFLOPS`
+- sparse decode: 最高约 `410 TFLOPS`
+
+这说明 DSA 从一开始就不是只写在论文里的训练 trick，而是带着可部署目标设计的。
+
+## sparse prefill kernel 的真实计算语义
+
+FlashMLA README 里给了 sparse prefill 的等价 PyTorch 代码，本质就是：
+
+```python
+Q: [s_q, h_q, d_qk]
+kv: [s_kv, h_kv, d_qk]
+indices: [s_q, h_kv, topk]
+
+focused_kv = kv[indices]
+P = Q @ focused_kv.transpose(-1, -2)
+S = softmax(P)
+out = S @ focused_kv
+```
+
+这里最值得注意的是：
+
+- kernel 直接吃 `indices`
+- 非选中 token 根本不会进入后续矩阵乘法
+- 这才是 DSA 真正的 `O(Lk)` 执行方式
+
+所以如果你只盯着 `model.py` 里 prefill 参考路径，会低估 DSA 的工程完成度。
+
+## sparse decode kernel 为什么这么难做
+
+decode 的难点不在“支持 top-k”，而在 **FP8 KV cache + 稀疏访存 + 高吞吐** 这三件事同时成立。
+
+FlashMLA 的深度说明文档里给了几个非常关键的信息。
+
+### 1. KV cache 内存压力非常大
+
+官方文档写得很直接：  
+在 128K 上下文下，单个请求的 KV cache 会非常大，这会造成：
+
+- OOM
+- batch 过小
+- GPU 利用率下降
+
+所以 DeepSeek 在 `V3.2` 里引入了 FP8 KV cache。
+
+### 2. 每个 token 的 FP8 KV cache 格式是精心设计过的
+
+每个 token 占 `656 bytes`：
+
+- 前 `512 bytes`: `float8_e4m3` 的 NoPE 部分
+- 中间 `16 bytes`: `4` 个 `float32` scale
+- 后 `128 bytes`: `64` 个 `bfloat16` 的 RoPE 部分
+
+这实际上就是在说：
+
+- 最适合压缩的是 latent noPE 部分
+- 最不该轻易压的是 RoPE 部分
+
+### 3. decode 的瓶颈不是 Tensor Core，而是 dequantization
+
+官方文档专门分析了时钟周期：
+
+- 每 token 的 MMA 计算大约 `34 cycles`
+- 但 FP8 -> BF16 的反量化至少大约 `50 cycles`
+
+因此 sparse decode kernel 是 **dequantization-bound**，不是纯计算 bound。
+
+这点很重要，因为它解释了为什么 DSA 的系统优化重点不只是“减少 attention token 数”，还包括“如何把反量化的代价摊薄”。
+
+## crossover：DSA 为什么能让 decode kernel 真正复用数据
+
+FlashMLA 的深度文档里，最值得看的工程点是 `crossover`。
+
+逻辑是这样的：
+
+- 同一个 query token 的所有 query heads，看的是同一份 top-k token 集合
+- DeepSeek-V3.2 有 `128` 个 query heads
+- 一个 CTA 处理其中 `64` 个 heads
+- 如果两个 CTA 分别处理同一个 query token 的两半 heads，那么它们其实需要同一批 dequantized K/V
+
+于是 DeepSeek 在 Hopper 上利用：
+
+- CTA cluster
+- Distributed Shared Memory
+
+让两个 CTA 各自只反量化一半 KV，再把结果互相写到对方可见的 shared memory，最后双方都拿到完整 dequantized K/V。
+
+这就是为什么 DSA 的“共享 top-k”设计不只是算法上的简化，而是 decode kernel 优化的前提。
+
+如果 top-k 是 per-head 独立的，这种共享就很难成立。
+
+## 从系统角度看，DSA 真正解决了什么
+
+如果只用一句“稀疏注意力降低复杂度”来总结 DSA，会漏掉它真正厉害的地方。
+
+更准确的总结是：
+
+- 在算法上，它把昂贵的 dense attention 改造成“轻量检索 + 稀疏精算”
+- 在训练上，它通过 dense attention 蒸馏式对齐，把 indexer 稳定训出来
+- 在模型结构上，它没有抛弃 MLA，而是把 DSA 嵌进 MLA
+- 在推理上，它把 sparse prefill 和 sparse decode 都做进了 FlashMLA
+- 在部署上，它结合 FP8 KV cache，把长上下文的显存成本进一步压低
+
+所以 DSA 不是一个 isolated trick，而是一套完整的联合设计。
+
+## 一个最实用的理解方式
+
+如果你以后再碰到 DSA，可以直接把它记成下面这个结构：
+
+```text
+current hidden state
+  -> lightweight indexer
+  -> top-k history tokens
+  -> full MLA attention on selected tokens only
+```
+
+以及再补一句：
+
+```text
+all query heads of the same token share the same selected token set
+```
+
+这两句话合起来，基本就抓住了 DSA 的算法本体和系统本体。
+
+## 最后给一个结论
+
+DeepSeek 的 DSA 真正有意思的地方，不是“把注意力做稀疏”本身，而是它把稀疏注意力做成了一个真正可训练、可推理、可部署的大模型组件。
+
+它同时解决了三件事：
+
+- **怎么选 token**：通过 lightning indexer 学一个轻量但有效的选择器
+- **怎么保持质量**：通过 dense warm-up 和 sparse continued training 让 selector 与主模型逐步对齐
+- **怎么真正跑快**：通过 MLA 结构、FP8 KV cache 和 FlashMLA sparse kernel，把算法优势变成真实系统收益
+
+这也是为什么 DSA 不该只被理解成一个“sparse attention 变体”，而应该被看成一套从训练到部署完整贯通的设计。
+
+## 参考资料
+
+- [DeepSeek-V2 官方仓库](https://github.com/deepseek-ai/DeepSeek-V2)
+- [DeepSeek-V3.2-Exp 技术报告](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf)
+- [DeepSeek-V3.2-Exp 官方仓库](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp)
+- [官方推理代码 `inference/model.py`](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py)
+- [671B 配置 `config_671B_v3.2.json`](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/config_671B_v3.2.json)
+- [FlashMLA README](https://github.com/deepseek-ai/FlashMLA/blob/main/README.md)
+- [FlashMLA: Hopper FP8 Sparse Decoding Deep Dive](https://github.com/deepseek-ai/FlashMLA/blob/main/docs/20250929-hopper-fp8-sparse-deep-dive.md)
