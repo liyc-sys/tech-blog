@@ -1,0 +1,463 @@
+---
+title: "Unlocking On-Policy Distillation for Any Model Family（中文翻译）"
+description: "Hugging Face 关于 GOLD 的完整中文翻译版，覆盖 on-policy distillation、跨 tokenizer 对齐、Countdown 实验、与 GRPO 对比以及 TRL 复现。"
+publishDate: 2026-04-12
+tags:
+  - distillation
+  - llm
+  - reinforcement-learning
+  - tokenizer
+  - qwen
+  - hugging-face
+  - translation
+draft: false
+---
+
+> 说明：本文是 Hugging Face 于 2025 年 10 月 29 日发布文章 **Unlocking On-Policy Distillation for Any Model Family** 的中文翻译版。
+>
+> 原文链接：[https://huggingface.co/spaces/HuggingFaceH4/on-policy-distillation](https://huggingface.co/spaces/HuggingFaceH4/on-policy-distillation)
+
+作者：Carlos Miguel Patiño、Kashif Rasul、Quentin Gallouédec、Ben Burtenshaw、Sergio Paniego、Vaibhav Srivastav、Thibaud Frere、Ed Beeching、Lewis Tunstall、Leandro von Werra、Thomas Wolf
+
+机构：Hugging Face
+
+发布时间：2025 年 10 月 29 日
+
+## 引言
+
+On-policy distillation 是一种非常高效的 LLM 压缩策略，Thinking Machines 的那篇优秀博客最近再次强调了这一点。它的做法是：从一个高性能“教师”模型的概率分布中迁移知识，来训练一个更小的“学生”模型。这样一来，学生模型可以模仿教师在任务上的表现，同时显著降低模型体积和推理延迟。
+
+本文提出 **General On-Policy Logit Distillation（GOLD）**，它把 on-policy distillation 扩展到一个长期存在的根本性弱点上：教师模型和学生模型必须共享同一个 tokenizer vocabulary。
+
+GOLD 建立在 **Universal Logit Distillation（ULD）**（Boizard et al., 2025）的基础上，特别适用于数学这类复杂、多步推理任务。我们的结果表明，GOLD 的效果优于 ULD，甚至也优于 GRPO。
+
+本文的主要贡献包括：
+
+- 在 TRL 中提供了 on-policy distillation 方法的开源实现，包括 `GKD` 和 `GOLD`，并验证了它们在多种模型组合上都能工作。
+- 将 ULD 扩展到 on-policy 设置中，也就是从学生模型采样 completion，再将其与教师分布对齐。
+- 实现了新的序列对齐与词表对齐方法，在教师与学生 tokenizer 不同的情况下显著改善蒸馏表现。
+
+有了这个基础，我们先退一步，回顾知识蒸馏方法的大背景：on-policy 方法是如何出现的，以及为什么把它扩展到“不同 tokenizer”的场景如此关键。
+
+## 蒸馏方法
+
+### Off-policy 与 on-policy distillation
+
+蒸馏主要有两类：off-policy 和 on-policy。
+
+- **Off-policy distillation**：在固定数据上训练学生模型，数据通常是教师预先计算好的 logits 或文本 completion。
+- **On-policy distillation**：教师对学生模型自己生成的输出提供反馈。
+
+**Generalised Knowledge Distillation（GKD）**（Agarwal et al., 2024）把这两类方法统一到一个共同框架下：通过支持一系列不同损失函数，它既能在静态教师数据上训练，也能在学生生成的轨迹上训练。GKD 论文表明，on-policy distillation 通常优于 off-policy 方法，这一点我们在本文后面也会再次验证。
+
+On-policy distillation 的优势主要有两点：
+
+1. 随着学生模型持续变强，它自己生成的数据质量也会逐步提高，从而形成正反馈循环。
+2. 这种“上下文对齐”迫使学生去学习它在真实推理时会遇到的那类错误与成功，而不是只学习教师模型才会生成的 completion。
+
+GKD 用参数 `λ` 控制 on-policy 与 off-policy 数据的混合比例：
+
+- `λ = 1`：完全 on-policy
+- `λ = 0`：完全离线
+
+公式如下：
+
+```math
+L_{GKD} = (1 - \lambda) L_{SD} + \lambda L_{OD}
+```
+
+其中：
+
+- `L_SD` 是 supervised distillation，利用教师生成的 off-policy 数据
+- `L_OD` 是 on-policy distillation，利用学生生成的数据以及教师 logits 给出的反馈
+
+与 RL 相比，GKD 也有两个明显优势：
+
+1. 不需要依赖只提供稀疏反馈的 reward function。
+2. 对于那些在初始阶段任务表现很弱的小模型，这种方法也能有效工作。
+
+传统 reward function 要么要求任务本身可验证，要么要求训练一个 reward model 对 completion 打分，而且通常只反馈最终结果，并不会明确指出推理过程中哪一部分是对的、哪一部分需要修正。
+
+而 on-policy distillation 可以在 **token 级别** 提供来自强教师的反馈，因此克服了这一缺点。对于小模型，这种方法尤其有效。Qwen3（Yang et al., 2025）的结果就表明：on-policy distillation 以远低于 RL 的算力预算，反而做得更好。
+
+不过，尽管 GKD 为 on-policy 训练打下了坚实基础，它默认教师和学生共享 tokenizer。下面我们将通过 **Universal Logit Distillation（ULD）** 来讨论这一限制。
+
+### Universal Logit Distillation
+
+所有现有 on-policy distillation 方法的主要限制是：默认教师和学生必须使用相同的 tokenizer。
+
+而现实中的 AI 生态包含多种模型家族，例如 SmolLM、Llama、Qwen、Gemma，它们各有长短；不同家族之间，甚至同一家族的不同版本之间，也往往使用不同 tokenizer。因此，如果强制教师和学生使用同一个 tokenizer，就会大幅限制 teacher-student pairing 的选择空间。
+
+近期工作 **Universal Logit Distillation（ULD）** 表明，即使教师和学生词表不完美对齐，也仍然可以进行蒸馏，不过它目前只处理 **离线设置**。
+
+_图 1：ULD 证明了在教师与学生 tokenizer 不一致时，也可以进行离线蒸馏。GOLD 在此基础上把方法扩展到 on-policy 设置，并重点修复了两个问题：第 3 步的 token 对齐，以及第 4 步的 logit 对齐。_
+
+ULD 指出，不同 tokenizer 下的蒸馏会带来两个关键挑战：
+
+1. **序列错位（sequence misalignment）**：不同 tokenizer 对同一段文本的切分方式不同。例如，Tokenizer A 可能把 “Hugging Face” 当作一个 token，而 Tokenizer B 会把它拆成两个 token。
+2. **词表错位（vocabulary misalignment）**：即使 token 字符串相同，它们在不同 tokenizer 中对应的 token ID 也不同。例如图 1 中，`awesome!` 在 Tokenizer A 中的 ID 是 2，在 Tokenizer B 中则是 0。
+
+同样的文本 `"Hugging Face is awesome!"`，在 Tokenizer A 里可能表示成 `[3, 1, 2]`，而在 Tokenizer B 里则表示成 `[2, 3, 1, 0]`。ULD 对这两个问题的处理方式是：
+
+- 把序列截断到共同的最短长度
+- 在 softmax 维度上，对较小词表做 padding，再通过排序来对齐词表
+
+_图 2：不同 tokenizer 带来的序列错位与词表错位。Tokenizer A 的词表更小，token ID 也不同，因此同一文本会被表示成长度和内容都不同的 token ID 序列。_
+
+ULD 虽然去掉了 tokenizer 必须相同的限制，但它仍然局限于离线设置。接下来我们介绍本文的核心贡献：**General On-Policy Logit Distillation（GOLD）**。它把 ULD 扩展到了 on-policy 设置，并引入了更好的对齐技术。
+
+## General On-Policy Logit Distillation（GOLD）
+
+虽然 ULD 允许在不同 tokenizer 间训练模型，但它在序列对齐和词表对齐上的方法都有明显局限。我们提出的 **GOLD** 在 ULD 基础上引入了更强的词表对齐技术，并将其推广到 on-policy 蒸馏。
+
+### 序列对齐
+
+我们首先处理的是 ULD 的序列对齐问题。ULD 的做法很简单：直接把序列截断到两个 tokenizer 中较短的那个长度。但这个做法会带来两个问题：
+
+1. 会丢失文本末尾的信息。
+2. 会造成 token 错位，导致同一个序列位置上蒸馏的是语义完全不同的 token。
+
+而且，这种对齐错误会随着 tokenizer 差异增大而变得更严重。因为一旦序列开头有一个 token 切分不一致，后续所有位置都可能发生连锁式语义错位。
+
+我们的办法不是截断，而是先识别出：为了让两个 tokenizer 的序列长度一致，哪些 token 需要被 merge。然后，我们在对应位置上通过 **把边缘分布与真实 continuation token 的条件概率做乘积** 的方式合并概率。
+
+我们之所以使用标量乘法来做 token merge，是为了利用 LLM 自回归采样的性质。以图 3 为例，如果我们想把蓝色序列里的 `"Hugging"` 和 `" Face"` 合并成一个 token，那么利用条件概率和乘法法则，就可以把它们对应的概率合并起来，从而在序列维度上保证两边严格对齐，不再受 tokenizer 切分差异影响。
+
+_图 3：GOLD 与 ULD 在序列对齐上的差异。ULD 直接把序列截断到最短长度；GOLD 则先找出应该 merge 的 token，使两边序列长度一致，再将 merge 后位置上的 logprob 相加，得到统一的序列位置分布。_
+
+解决完序列错位之后，我们接着处理词表对齐问题。
+
+### 词表对齐
+
+GOLD 的第二个扩展，是在词表维度上用一种更好的方式替换掉 ULD 的排序操作。
+
+ULD 的假设是：两个 tokenizer 之间无法建立 token 映射，因此在把 logits pad 到相同大小后，只能在 softmax 维度做排序。这个过程背后的假设是：即便 token ID 被重排了，softmax 分布本身也仍然相同，或者至少相似。
+
+我们认为这个假设在很多场景下是合理的，但实际上还可以进一步利用两个词表之间**真实存在的一对一 token 映射**。例如图 4 中，`awesome!` 同时存在于两个 tokenizer 中，只是 token ID 不同。
+
+在 GOLD 中，我们会找出这些在两个词表中都存在的 token 映射，然后对这些 token 直接使用 GKD 中“假设 tokenizer 相同”的 KL loss。对于那些找不到完美匹配的 token，再退回到 ULD 的排序流程。这样一来，未匹配 token 仍然能被纳入训练，而已经匹配上的 token 则不必再依赖粗糙的排序近似。
+
+因此，GOLD 的总损失可以写成：
+
+```math
+L_{GOLD}(x, y) = w_1 L_{GKD} + w_2 L_{ULD}
+```
+
+其中：
+
+- 对于有一对一映射的 token，使用 `L_GKD`
+- 对于没有映射的 token，使用 `L_ULD`
+
+在 TRL 实现里，我们允许用户分别设置这两个部分的权重；实验中我们也提供了表现较好的默认值。
+
+_图 4：GOLD 与 ULD 在词表对齐上的差异。GOLD 会尽可能在两个 tokenizer 中寻找 1:1 的 token 映射，并对这些 token 直接应用 GKD 的 KL 损失；对无法映射的 token，再退回 ULD 的排序处理。最终损失是两项之和。_
+
+设计讲清楚之后，下面我们来看实验设置：任务、数据集和模型分别是什么。
+
+## 实验设置
+
+### 任务定义
+
+我们使用一个名为 **Countdown** 的数学游戏（Gandhi et al., 2024）作为任务。目标是：给定一组数字，只使用 `+`、`-`、`*`、`/` 四种运算，算出目标值。
+
+此外，模型必须按照指定格式给出答案，因为我们设置了一个严格 parser：如果答案不满足格式要求，就直接判错。只有同时满足以下条件，答案才算正确：
+
+- 每个数字只能使用一次
+- 模型给出的等式结果必须等于目标值
+- 答案必须写在 `<answer> </answer>` 标签内
+
+文中还给出了传给模型的 system prompt 和 user prompt 示例。
+
+### 数据集
+
+所有 prompt 都来自 `Jiayi-Pan/Countdown-Tasks-3to4` 数据集。完整数据集包括：
+
+- 8 万条训练 prompt
+- 1 万条随机选取的测试 prompt
+
+随后，我们分别用以下教师模型生成回答：
+
+- `Qwen/Qwen2.5-7B-Instruct`
+- `Qwen/Qwen3-4B-Instruct-2507`
+
+只保留教师答对了的 prompt。
+
+最终公开的数据集规模为：
+
+- `Qwen/Qwen2.5-7B-Instruct` 版本：30.4k prompt
+- `Qwen/Qwen3-4B-Instruct-2507` 版本：27.7k prompt
+
+对于所有 on-policy 实验，我们统一使用 30.4k prompt 的训练集，因为 on-policy 情况下我们用的是学生生成的结果，而不是教师的 completion。
+
+### 使用的模型
+
+为了考察模型规模、基础性能，以及 tokenizer 相似度对知识蒸馏的影响，我们设计了多个 student-teacher 组合。
+
+教师全部选用不同规模的 Qwen 模型，而学生则来自三个不同家族：Qwen、Llama 和 Gemma。这样一来，蒸馏任务本身就很难，因为所有学生模型在 Countdown 上的初始分数都低于 0.08，而教师模型的分数则在 0.35 到 0.76 之间。
+
+| 类型 | 模型 | Countdown 分数 |
+| --- | --- | --- |
+| Student | `meta-llama/Llama-3.2-1B-Instruct` | 0.016 |
+| Student | `Qwen/Qwen2.5-1.5B-Instruct` | 0.076 |
+| Student | `google/gemma-3-1b-it` | 0.023 |
+| Teacher | `Qwen/Qwen2.5-7B-Instruct` | 0.3555 |
+| Teacher | `Qwen/Qwen3-4B-Instruct-2507` | 0.7145 |
+
+### Tokenizer 相似度
+
+我们假设：GOLD 的效果会与教师和学生词表的相似度正相关。为此，我们定义了一个基于 **Jaccard index（IoU）** 的 tokenizer 相似度指标：
+
+- 交集：两个词表中可以匹配到的 token 数量
+- 并集：两个词表中所有不重复 token 的总数
+
+文中给出了两种情况下的对比：
+
+1. **严格匹配**：要求 token ID 也相同
+2. **token 内容映射**：即便 token ID 不同，只要 token 内容相同也算匹配
+
+结果显示，在严格匹配时：
+
+- `meta-llama/Llama-3.2-1B-Instruct` 与所有教师的相似度都是 0
+- `google/gemma-3-1b-it` 与所有教师的相似度也是 0
+
+而在允许 token 内容映射之后：
+
+- Llama 的相似度提升到 0.64
+- Gemma 的相似度提升到 0.063
+
+另外，Qwen2.5 与 Qwen3 的 tokenizer 只差极少几个 token。事实上，Qwen3 的 tokenizer 本质上就是 Qwen2.5 tokenizer 加上 4 个额外 token：
+
+- `<think>`
+- `<tool_response>`
+- `</tool_response>`
+- `</think>`
+
+因此，在实验里我们基本可以把 Qwen2.5 与 Qwen3 的 tokenizer 视为等价。
+
+## 实验
+
+### 相同 tokenizer 下的 GKD
+
+我们的第一个目标是验证 GKD 实现是否正确，方法是拿自己的结果与 Agarwal 等人（2024）报告的结果进行比较。
+
+这里重点考察了 5 个不同 `λ` 值的 ablation，也就是不同 on-policy / off-policy 混合比例。教师模型用 `Qwen/Qwen3-4B-Instruct-2507`，学生模型用 `Qwen/Qwen2.5-1.5B-Instruct`。
+
+在离线部分，我们事先用教师模型生成 prompt completion，以便加速训练。学生采样时的 temperature 设为 `γ = 1`，并在 `L_OD` 中使用 `forward KL divergence（β = 0）`。
+
+结果表明：只要包含一定比例的 on-policy 训练，就能明显优于纯 SFT。并且随着 `λ` 增大，性能也在变好；完全 on-policy 的设置整体效果最好。
+
+这说明：在教师与学生 tokenizer 相同的情况下，完全 on-policy 训练优于仅使用离线数据训练。
+
+_图 5：`λ` 参数的消融实验。`λ` 控制 on-policy loss（`λ=1.0`）与 supervised loss（`λ=0.0`）之间的混合比例。_
+
+### 蒸馏出的教师知识
+
+在尝试多种配置之后，我们找到了一个稳定设置：可以持续蒸馏出教师模型 **80% 以上** 的性能。这种高蒸馏比例在不同规模教师模型上都成立，如图 6 所示，说明我们的 on-policy GKD 实现是可靠的。
+
+这些结果也凸显了一个基本事实：学生模型的性能上限，很大程度上受限于教师模型本身的能力。因此，要想把学生做强，首先要选一个足够强的教师。
+
+_图 6：在不同教师规模下，蒸馏都较为稳定。学生固定为 `Qwen/Qwen2.5-1.5B-Instruct`，教师分别是 `Qwen/Qwen2.5-7B-Instruct` 与 `Qwen/Qwen3-4B-Instruct-2507`。两种情况下都恢复了教师 80% 以上的性能，说明知识蒸馏中教师选择非常关键。_
+
+这些结果验证了我们的 GKD 实现。接下来的问题是：如果教师和学生的 tokenizer 不同，on-policy distillation 是否仍然可行？
+
+### 不同 tokenizer 下，on-policy distillation 依然有效
+
+虽然在相同 tokenizer 下，GKD 可以恢复教师 80% 以上的性能，但它只能处理 tokenizer 匹配的 teacher-student 组合。接下来的实验就是为了解决这个限制：我们测试不同模型家族之间的蒸馏，也就是 tokenizer 不同的场景。
+
+这种场景需要能同时处理 **序列错位** 和 **词表错位** 的方法。因此，我们把 baseline ULD 与本文提出的 GOLD 进行对比，看看哪个方法在这类场景中更有效。
+
+### Tokenizer 相似度会影响性能
+
+Tokenizer 相似度决定了我们在序列和词表维度上需要做多少对齐。我们原本假设：相似度越低，任务表现越差；实验结果证实了这一点。GOLD 在 Countdown 任务上的表现，会随着 tokenizer 相似度下降而下降。
+
+这是一种预期内的权衡，因为当两个词表差异越大，对齐过程就越容易引入噪声。不过即便如此，后文仍然会看到：在相似度为 0.64 的情况下，GOLD 依然优于 RL。
+
+| 学生模型 | Countdown 表现 | 与 `Qwen3-4B-Instruct-2507` 的相似度 |
+| --- | --- | --- |
+| `Qwen/Qwen2.5-1.5B-Instruct` | 0.6515 | 0.999974 |
+| `meta-llama/Llama-3.2-1B-Instruct` | 0.4235 | 0.64 |
+| `google/gemma-3-1b-it` | 0.0305 | 0.063 |
+
+### GOLD 优于 ULD
+
+为了验证这些改进，我们选择：
+
+- 学生：`meta-llama/Llama-3.2-1B-Instruct`
+- 教师：`Qwen/Qwen3-4B-Instruct-2507`
+
+图 7 的结果显示，两种方法差距很大：
+
+- **GOLD**：把学生初始性能提升了 25%，恢复了教师 60% 的性能。
+- **ULD**：只把学生提升了 5%，仅恢复了教师 10% 的性能。
+
+这说明，GOLD 更强的对齐技术确实有效。这个 teacher-student pair 在严格 token ID 匹配下，相似度本来是 0；但通过 token 内容映射后，相似度提升到了 0.64。再结合改进后的序列对齐方法，GOLD 可以在 ULD 几乎失败的场景中依然实现有效知识迁移，甚至做到了接近 RL 方法的水平。
+
+_图 7：把 `Qwen/Qwen3-4B-Instruct-2507` 蒸馏到 `meta-llama/Llama-3.2-1B-Instruct` 时，GOLD 明显优于 ULD。图中也显示两者都有较长 warmup：模型性能大约在第 1000 步之后才出现明显提升。_
+
+既然 GOLD 已经证明自己能有效处理 tokenizer 不同的问题，接下来我们将它与 RL 算法 GRPO 做正面比较。
+
+### On-policy distillation 优于 GRPO
+
+On-policy distillation 会使用学生自己生成的 completion，因此训练数据是随着模型进步而不断更新的。在已经证明这种方法优于 SFT 之后，我们进一步把它与另一类 on-policy 方法比较：**Group Relative Policy Optimization（GRPO）**。
+
+GRPO 是 DeepSeek-Math 论文（Shao et al., 2024）提出的一种 RL 方法，后来随着 DeepSeek R1 的发布而广为人知。
+
+我们按照 Philipp Schmid 的 Countdown 任务 GRPO 教程来做，并与 KD 的效果进行比较。奖励函数由三个部分组成：
+
+1. **Format**：如果回答正确使用了标签，就给 `+1`
+2. **Following Rules**：如果模型遵守了题目规则，只用给定数字，且每个数字只用一次，就给 `+1`
+3. **Correct Equation**：如果最终方程正确，就给 `+1`
+
+原教程把 Format 和 Following Rules 合并成了一个奖励函数，但我们发现把它们拆成两个独立奖励项，效果更好。
+
+图 8 给出了两种场景的结果：
+
+- 上图：教师和学生 tokenizer 相同
+- 下图：教师和学生 tokenizer 不同
+
+在相同 tokenizer 场景下，KD 的表现大约是 GRPO 的 **2 倍**。在不同 tokenizer 场景下，KD 和 GRPO 的差距变小了一些，但 GOLD 仍然比 GRPO **高出 20%**。
+
+这与 Qwen3 Technical Report 的结论一致：on-policy distillation 与 RL 相比，通常至少相当，很多时候更好。本文进一步推进了这一点，因为我们不仅在相同 tokenizer 情况下优于 RL，甚至在**跨模型家族、跨 tokenizer** 的组合下也做到了这一点。
+
+_图 8：在训练 `meta-llama/Llama-3.2-1B-Instruct` 时，GKD 和 GOLD 都优于 GRPO。GKD 的提升更大，是因为在 tokenizer 相同的情况下，它能更好地蒸馏教师；但即便是不同 tokenizer 下的 GOLD，也依然优于 GRPO。_
+
+## 领域蒸馏
+
+Thinking Machines 的博客里，作者把语言模型蒸馏用于个性化。他们先在内部领域数据集和内部评测上提升一个 `Qwen3-8B` 模型的领域能力，再恢复它在指令跟随 benchmark IFEval 上的表现。这很有价值，因为模型在做领域 SFT 时，常常会丢失 instruction following 能力。
+
+Thinking Machines 的做法是：在领域数据上的 continued pre-training（mid-training）阶段，与高质量聊天数据集 `allenai/tulu-3-sft-mixture` 上的 On-policy Distillation 阶段交替进行。结果表明，在做过 on-policy distillation 之后，聊天性能可以被恢复。
+
+为了让这些结果变得可复现，下面我们展示如何用开源数据集和 TRL 框架复现整套流程。
+
+## 在 TRL 中复现
+
+我们可以用开放模型和开放数据集，在 TRL 中复现上述过程，并共享完整实现。
+
+相较于 Thinking Machines 的原始实验，我们做了一些替换，使其不再依赖“内部文档数据集和内部 benchmark”：
+
+- 用 `open-r1/codeforces` 作为领域数据集
+- 用 `livecodebench` 作为与 Codeforces 编程任务对应的评测 benchmark
+- 保持使用 `allenai/tulu-3-sft-mixture` 数据集，以及 IFEval benchmark
+- 使用 `Qwen/Qwen3-4B-Instruct-2507` 模型
+
+### 在 `open-r1/codeforces` 上做监督微调
+
+我们使用 `SFTTrainer` 在 `open-r1/codeforces` 上微调 `Qwen/Qwen3-4B-Instruct-2507`。
+
+结果是：
+
+- `livecodebench` 从 **35.1%** 提升到 **40.3%**
+- 但 `IFEval` 从 **83.4%** 降到 **79.5%**
+
+这正是领域 SFT 中常见的现象：领域能力变强了，但 instruction following 退步了。
+
+需要说明的是，这里我们只训练了 1000 步并提早停止。如果你想更系统地研究面向高级推理任务的 finetuning，可以参考 Open R1 项目的相关文章。
+
+### 在 `allenai/tulu-3-sft-mixture` 上做 GKD
+
+在上一步的 SFT checkpoint 基础上，我们再使用 `GKDTrainer`，在 `allenai/tulu-3-sft-mixture` 数据集上继续训练。
+
+结果是：
+
+- `IFEval` 从 **79.5%** 提升到 **82.8%**
+- 同时 `livecodebench` 仍保持在 **39.8%** 左右
+
+表格如下：
+
+| 模型 | IFEval | LCB |
+| --- | --- | --- |
+| `Qwen3-4B` | 83.4 | 35.1 |
+| `Qwen3-4B + Codeforces SFT` | 79.48 | 40.29 |
+| `Qwen3-4B + Codeforces SFT + Tulu3 GKD` | 82.8 | 39.8 |
+
+这说明：我们可以先通过 Codeforces SFT 提升领域能力，再通过蒸馏恢复 instruction following。
+
+### 自己动手复现
+
+如果你也想在自己的任务或 Hugging Face Hub 上的数据集上尝试知识蒸馏，本文还给出了对应 recipe：
+
+- SFT Recipe
+- Distillation Recipe
+
+## 结论
+
+本文提出了 **General On-Policy Logit Distillation（GOLD）**。它是一种新的 on-policy knowledge distillation 方法，即使教师和学生不共享 tokenizer vocabulary，也仍然可以有效蒸馏。这解决了现有 on-policy 方法（如 GKD）的一个重要限制，因为后者要求 tokenizer 必须匹配。
+
+GOLD 建立在离线 ULD 方法基础之上，但关键是把它扩展到了 on-policy 设置，并且修复了 ULD 的两个主要弱点：
+
+1. 我们用 token merging 策略替代了 ULD 朴素的序列截断方法。这个策略通过把边缘分布与标量条件概率相乘，来完成 token 级合并。
+2. 我们实现了一种混合式词表对齐方法：对于共享 token，使用直接映射的 loss；只有在找不到匹配时，才退回到 ULD 的排序方法。
+
+在 Countdown 数学任务上的实验验证了 GOLD 的优势：
+
+- 与原始离线 ULD 相比，GOLD 恢复了教师 **60%** 的性能，而 ULD 只有 **10%**
+- 相比 supervised fine-tuning baseline，GOLD 更高 **15%**
+- 相比 GRPO baseline，GOLD 的表现达到 **2 倍**
+- 即使在困难的跨 tokenizer 场景下，GOLD 依然比 GRPO **高 20%**
+
+这些结果说明，GOLD 是一种既强大又灵活的模型蒸馏技术。它为“从任意高性能教师蒸馏到任意学生”提供了一条可行路径，而且不再受 tokenizer 是否一致的限制。与 reinforcement learning 相比，它也是一种更高效、更节省 token 的替代方案。
+
+## 引用
+
+如果在学术语境中引用本文，请使用：
+
+```text
+Carlos Miguel Patiño, Kashif Rasul, Quentin Gallouédec, Ben Burtenshaw, Sergio Paniego,
+Vaibhav Srivastav, Thibaud Frere, Ed Beeching, Lewis Tunstall, Leandro von Werra,
+Thomas Wolf (2025).
+"Unlocking On-Policy Distillation for Any Model Family".
+```
+
+BibTeX：
+
+```bibtex
+@misc{patiño2025_unlocking_on_policy_distillation_for_any_model_family,
+  title={Unlocking On-Policy Distillation for Any Model Family},
+  author={Carlos Miguel Patiño and Kashif Rasul and Quentin Gallouédec and Ben Burtenshaw and
+  Sergio Paniego and Vaibhav Srivastav and Thibaud Frere and Ed Beeching and Lewis Tunstall and
+  Leandro von Werra and Thomas Wolf},
+  year={2025},
+}
+```
+
+## 参考文献
+
+1. Agarwal, R., Vieillard, N., Zhou, Y., Stanczyk, P., Ramos, S., Geist, M., & Bachem, O. (2024). *On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes*. https://huggingface.co/papers/2306.13649
+2. Boizard, N., Haddad, K. E., Hudelot, C., & Colombo, P. (2025). *Towards Cross-Tokenizer Distillation: the Universal Logit Distillation Loss for LLMs*. https://huggingface.co/papers/2402.12030
+3. DeepSeek-AI et al. (2025). *DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning*. https://huggingface.co/papers/2501.12948
+4. Gandhi, K. et al. (2024). *Stream of Search (SoS): Learning to Search in Language*. https://huggingface.co/papers/2404.03683
+5. Shao, Z. et al. (2024). *DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models*. https://huggingface.co/papers/2402.03300
+6. Yang, A. et al. (2025). *Qwen3 Technical Report*. https://huggingface.co/papers/2505.09388
+
+## 注释
+
+1. 完整的 GKD 损失可形式化写为：
+
+```math
+L_{GKD} := (1 - \lambda)\mathbb{E}_{(x,y)\sim(X,Y)}[D_{JSD}^{(\beta)}]
++ \lambda \mathbb{E}_{x\sim X}\left[\mathbb{E}_{y\sim p_S(\cdot|x)}[D_{JSD}^{(\beta)}]\right]
+```
+
+2. 为什么可以用链式法则来 merge 概率？对位置 `i` 上的 merge 后分布，有：
+
+```math
+P_{\text{merged}}(y) = P(y \mid x)\times P(\text{token}_1 \mid x)\times P(\text{token}_2 \mid \text{token}_1, x)\times \cdots
+```
+
+这能正确给出真实生成序列的联合概率，同时为反事实 token 提供一个合理近似。
+
+3. 参数 `β` 控制的是 student（`S`）与 teacher（`T`）之间的 generalized Jensen-Shannon divergence：
+
+```math
+D_{JSD}^{(\beta)}(p_S, p_T)
+=
+\beta \cdot D_{KL}(p_S \parallel \pi)
++
+(1-\beta)\cdot D_{KL}(p_T \parallel \pi)
+```
+
+其中：
+
+```math
+\pi = \beta \cdot p_S + (1-\beta)\cdot p_T
+```
