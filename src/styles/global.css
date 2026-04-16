@@ -303,6 +303,22 @@ pre {
   margin-top: 2rem;
 }
 
+.article__body img,
+.article__body picture img {
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
+}
+
+.article__body picture {
+  display: block;
+}
+
+.article__body figure {
+  margin: 1.6rem 0;
+}
+
 .article__body h2,
 .article__body h3 {
   margin-top: 2.2rem;
