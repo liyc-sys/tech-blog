@@ -62,9 +62,9 @@ GKD 用参数 `λ` 控制 on-policy 与 off-policy 数据的混合比例：
 
 公式如下：
 
-```math
+$$
 L_{GKD} = (1 - \lambda) L_{SD} + \lambda L_{OD}
-```
+$$
 
 其中：
 
@@ -139,9 +139,9 @@ ULD 的假设是：两个 tokenizer 之间无法建立 token 映射，因此在�
 
 因此，GOLD 的总损失可以写成：
 
-```math
+$$
 L_{GOLD}(x, y) = w_1 L_{GKD} + w_2 L_{ULD}
-```
+$$
 
 其中：
 
@@ -433,31 +433,31 @@ BibTeX：
 
 1. 完整的 GKD 损失可形式化写为：
 
-```math
+$$
 L_{GKD} := (1 - \lambda)\mathbb{E}_{(x,y)\sim(X,Y)}[D_{JSD}^{(\beta)}]
 + \lambda \mathbb{E}_{x\sim X}\left[\mathbb{E}_{y\sim p_S(\cdot|x)}[D_{JSD}^{(\beta)}]\right]
-```
+$$
 
 2. 为什么可以用链式法则来 merge 概率？对位置 `i` 上的 merge 后分布，有：
 
-```math
+$$
 P_{\text{merged}}(y) = P(y \mid x)\times P(\text{token}_1 \mid x)\times P(\text{token}_2 \mid \text{token}_1, x)\times \cdots
-```
+$$
 
 这能正确给出真实生成序列的联合概率，同时为反事实 token 提供一个合理近似。
 
 3. 参数 `β` 控制的是 student（`S`）与 teacher（`T`）之间的 generalized Jensen-Shannon divergence：
 
-```math
+$$
 D_{JSD}^{(\beta)}(p_S, p_T)
 =
 \beta \cdot D_{KL}(p_S \parallel \pi)
 +
 (1-\beta)\cdot D_{KL}(p_T \parallel \pi)
-```
+$$
 
 其中：
 
-```math
+$$
 \pi = \beta \cdot p_S + (1-\beta)\cdot p_T
-```
+$$

@@ -1,6 +1,8 @@
 import { defineConfig } from "astro/config";
 import mdx from "@astrojs/mdx";
 import sitemap from "@astrojs/sitemap";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 
 const owner = process.env.GITHUB_REPOSITORY_OWNER ?? "liyc-sys";
 const repo = process.env.GITHUB_REPOSITORY?.split("/")[1] ?? "tech-blog";
@@ -15,6 +17,8 @@ export default defineConfig({
   integrations: [mdx(), sitemap()],
   trailingSlash: "always",
   markdown: {
+    remarkPlugins: [remarkMath],
+    rehypePlugins: [rehypeKatex],
     shikiConfig: {
       theme: "github-dark",
       wrap: true,
