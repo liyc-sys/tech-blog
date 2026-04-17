@@ -5,6 +5,7 @@ import TagPill from "../../components/TagPill.astro";
 import { getPublishedPosts, slugifyTag } from "../../lib/posts";
 import type { Post } from "../../lib/posts";
 import { withBase } from "../../lib/site";
+import "../../styles/post-content.css";
 
 export async function getStaticPaths() {
   const posts = await getPublishedPosts();
