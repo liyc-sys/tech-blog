@@ -1,6 +1,5 @@
 ---
 title: "多轮强化学习中的Credit Assignment"
-description: "转载自知乎专栏原文，正文保持原样，系统梳理多轮强化学习与工具调用 agent 训练中的 Credit Assignment 方法。"
 publishDate: 2026-04-17
 tags:
   - reinforcement-learning
@@ -9,11 +8,6 @@ tags:
   - zhihu-repost
 draft: false
 ---
-
-> 来源: [https://zhuanlan.zhihu.com/p/2027886729370112995](https://zhuanlan.zhihu.com/p/2027886729370112995)
-> 作者: Aurora
-> 简介: ​关注52 人赞同了该文章
-> 时间: 编辑于 2026-04-15 23:25・北京
 
 ## 先看共性问题
 
@@ -1110,3 +1104,10 @@ $$
 代表文章：
 
 -   **RAGEN / StarPO**（2025）：长时程多轮 RL 存在 "`Echo Trap`"——模型反复生成相似的失败模式，方差塌陷，梯度爆炸。`StarPO-S` 通过**轨迹过滤 + 解耦 clip** 缓解这个问题，使 agent 场景下的 RL 训练首次能在较长 horizon 上稳定收敛。
+
+## 来源
+
+> 来源: [https://zhuanlan.zhihu.com/p/2027886729370112995](https://zhuanlan.zhihu.com/p/2027886729370112995)
+> 作者: Aurora
+> 简介: ​关注52 人赞同了该文章
+> 时间: 编辑于 2026-04-15 23:25・北京
