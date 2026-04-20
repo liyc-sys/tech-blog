@@ -37,7 +37,9 @@ const { post } = Astro.props;
     <a href={withBase(`/posts/${post.id}/`)}>{post.data.title}</a>
   </h2>
 
-  <p class="post-card__description">{post.data.description}</p>
+  {post.data.description && (
+    <p class="post-card__description">{post.data.description}</p>
+  )}
 
   <div class="post-card__tags">
     {

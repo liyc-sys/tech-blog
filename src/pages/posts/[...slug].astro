@@ -53,7 +53,7 @@ const { Content } = await render(post);
     </div>
 
     <h1>{post.data.title}</h1>
-    <p class="article__dek">{post.data.description}</p>
+    {post.data.description && <p class="article__dek">{post.data.description}</p>}
 
     <div class="article__tags">
       {
