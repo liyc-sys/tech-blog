@@ -461,3 +461,106 @@ $$
 $$
 \pi = \beta \cdot p_S + (1-\beta)\cdot p_T
 $$
+
+## 补充问答
+
+### Q1. ULD 到底是什么？它解决了什么问题？
+
+**Universal Logit Distillation（ULD）** 的核心目标是：即使 teacher 和 student 的 tokenizer 不同、词表不同，也能继续做 logit distillation。
+
+普通的 KL 蒸馏默认两边输出分布定义在同一个 vocabulary 上，因此要求 token 一一对应。但跨模型家族时，常见情况是：
+
+- 同一段文本会被切成不同 token 序列
+- 两边词表里的 token 也无法直接一一对应
+
+ULD 的思路是放弃“必须逐 token 精确对齐”的前提，改为在更粗的层面比较 teacher 和 student 的输出分布。它主要处理两个问题：
+
+1. **序列长度不一致**：原始 ULD 用较粗糙的截断策略来对齐位置。
+2. **词表不一致**：不再要求两个 distribution 落在同一组 token 上，而是通过排序后的分布形状来比较 teacher 和 student。
+
+所以你可以把 ULD 记成：
+
+**把“同 tokenizer 才能做 logit distillation”这个限制去掉，让跨 tokenizer 蒸馏变得可行。**
+
+### Q2. GOLD 相比 ULD，具体改了什么？
+
+GOLD 可以理解成：**on-policy 版的 ULD，再加上更细的对齐方式。**
+
+它相对 ULD 的改进主要有两层：
+
+1. **序列对齐更好**
+
+ULD 直接把两个序列截断到较短长度，容易让后续位置整体错位。GOLD 则先找出哪些连续 token 需要 merge，先把两边变成同一组文本 span，再在对齐后的位置上比较分布。
+
+2. **词表对齐更好**
+
+ULD 对所有 token 都只能依赖排序近似。GOLD 则采用 hybrid 方案：
+
+- 对两个词表中能直接匹配上的 token，使用和 GKD 一样的 KL distillation
+- 对没法直接映射的 token，再退回到 ULD 的排序方法
+
+再加上 GOLD 是 **on-policy distillation**，训练时 student 先自己采样，teacher 再对 student 的真实轨迹给出概率监督，所以它学到的是“我自己现在会走到哪里、老师会如何评价这条路径”。
+
+### Q3. 为什么 merge 里会出现 $P(\text{" Face"} \mid x, \text{"Hugging"})$ 这样的条件概率？
+
+这不是 GOLD 额外发明的量，而是 **自回归语言模型本来就按链式法则定义概率**。
+
+如果某一侧 tokenizer 把 `"Hugging Face"` 切成两个 token：
+
+- $t_1=\text{"Hugging"}$
+- $t_2=\text{" Face"}$
+
+那么在前缀 $x$ 下，这段文本的联合概率天然就是：
+
+$$
+P(t_1,t_2 \mid x)=P(t_1 \mid x)\cdot P(t_2 \mid x,t_1)
+$$
+
+也就是：
+
+$$
+P(\text{"Hugging Face"} \mid x)
+=
+P(\text{"Hugging"} \mid x)\cdot P(\text{" Face"} \mid x,\text{"Hugging"})
+$$
+
+这里的条件概率含义很直接：
+
+**模型已经生成了 `"Hugging"` 之后，下一步继续生成 `" Face"` 的概率。**
+
+所以 GOLD 的 merge 不是把 token 文本硬拼起来，而是把多个连续生成步骤的联合概率算出来。等价地，在 log space 里就是把对应位置的 logprob 相加。
+
+### Q4. 在实际计算时，这个 merge 概率到底怎么得到？是不是就是乘在一起？
+
+是的。实际实现里，本质上就是沿着真实前缀把条件概率乘起来；为了数值稳定，代码里通常会直接把 **logprob 相加**。
+
+假设 student 把某个 span 切成：
+
+- `"Hugging"`
+- `" Face"`
+
+而它们前面的共同上下文是 $x$。那么计算流程就是：
+
+1. 把前缀 $x$ 喂给 student，取出 token `"Hugging"` 的概率  
+   得到 $P(\text{"Hugging"} \mid x)$
+2. 再把 `"Hugging"` 接到前缀后面，跑下一步  
+   取出 token `" Face"` 的概率，得到 $P(\text{" Face"} \mid x,\text{"Hugging"})$
+3. 两者相乘，得到整个 span `"Hugging Face"` 的概率
+
+$$
+P(\text{"Hugging Face"} \mid x)
+=
+P(\text{"Hugging"} \mid x)\cdot P(\text{" Face"} \mid x,\text{"Hugging"})
+$$
+
+对应地：
+
+$$
+\log P(\text{"Hugging Face"} \mid x)
+=
+\log P(\text{"Hugging"} \mid x)+\log P(\text{" Face"} \mid x,\text{"Hugging"})
+$$
+
+所以这里不是“额外假设 Face 默认 condition on Hugging”，而是：
+
+**自回归模型本来就只会在已有前缀条件下预测下一个 token；把多个 token 合成一个 span 时，联合概率自然就是这些条件概率的连乘。**
